@@ -7,10 +7,9 @@ import sys
 from contextlib import closing
 from pathlib import Path
 
-from click.testing import Result
 from PIL import Image
 import pytest
-from typer.testing import CliRunner
+from typer.testing import CliRunner, Result
 
 import assetguard.cli as cli_module
 import assetguard.html_reporting as html_module

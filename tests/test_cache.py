@@ -5,10 +5,9 @@ import sqlite3
 from contextlib import closing
 from pathlib import Path
 
-from click.testing import Result
 from PIL import Image
 import pytest
-from typer.testing import CliRunner
+from typer.testing import CliRunner, Result
 
 import assetguard.scanner as scanner_module
 from assetguard.cache import (

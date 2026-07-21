@@ -39,6 +39,13 @@ SOURCE_HASHES = {
     "reporting.py": "d7375fbefa1ce10b89fb27f72abf3456851cdd87fb64c9a06c9e6167bb11156e",
     "scanner.py": "0f578c7f9814ed9bd82ec543f5aef417753c8c1c95fa3ec204dc1d8ee1b12f4e",
 }
+RELEASE_ARTIFACTS = verifier.release_artifacts(PROJECT_ROOT, verifier.EXPECTED_VERSION)
+RELEASE_ARTIFACTS_AVAILABLE = all(
+    path.is_file() for path in RELEASE_ARTIFACTS.ordered_paths()
+)
+PHASE07_RELEASE_INTEGRITY_REQUESTED = (
+    os.environ.get("ASSETGUARD_PHASE07_RELEASE_INTEGRITY") == "1"
+)
 SANDBOX_AVAILABLE = (
     sys.platform == "win32"
     and (Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "WindowsSandbox.exe").is_file()
@@ -46,13 +53,56 @@ SANDBOX_AVAILABLE = (
 INTEGRATION_ENABLED = (
     os.environ.get("ASSETGUARD_WINDOWS_SANDBOX_INTEGRATION") == "1"
     and SANDBOX_AVAILABLE
-    and all((PROJECT_ROOT / "dist" / "release" / name).is_file() for name in verifier.EXPECTED_HASHES)
+    and RELEASE_ARTIFACTS_AVAILABLE
 )
 
+SYNTHETIC_PAYLOADS = {
+    "AssetGuard.exe": b"synthetic AssetGuard executable\n",
+    "README.md": b"# Synthetic AssetGuard release\n",
+    "examples/rules.yaml": b"version: 1\n",
+}
 
-def _manifest() -> dict[str, object]:
-    path = PROJECT_ROOT / "dist" / "release" / "AssetGuard-0.1.0-windows-x86_64.manifest.json"
-    return json.loads(path.read_text(encoding="utf-8"))
+
+def _synthetic_manifest() -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "product": {
+            "name": "AssetGuard",
+            "version": "0.1.0",
+            "platform": "windows",
+            "architecture": "x86_64",
+            "format": "pyinstaller-onefile",
+        },
+        "toolchain": {
+            "python": "3.13.9",
+            "pyinstaller": "6.21.0",
+            "pyinstaller_hooks_contrib": "2026.6",
+            "source_date_epoch": 1767225600,
+        },
+        "source": {"sha256": verifier.EXPECTED_SOURCE_DIGEST},
+        "payload": [
+            {
+                "path": path,
+                "size": len(data),
+                "sha256": hashlib.sha256(data).hexdigest(),
+            }
+            for path, data in SYNTHETIC_PAYLOADS.items()
+        ],
+    }
+
+
+def _write_synthetic_release_zip(path: Path) -> Path:
+    with zipfile.ZipFile(path, "w") as archive:
+        for member, data in zip(
+            verifier.EXPECTED_ZIP_MEMBERS,
+            SYNTHETIC_PAYLOADS.values(),
+            strict=True,
+        ):
+            entry = zipfile.ZipInfo(member, date_time=(1980, 1, 1, 0, 0, 0))
+            entry.compress_type = zipfile.ZIP_STORED
+            entry.external_attr = 0o100644 << 16
+            archive.writestr(entry, data)
+    return path
 
 
 def _valid_result() -> dict[str, object]:
@@ -120,7 +170,17 @@ def test_application_source_hashes_remain_phase07_exact() -> None:
     assert actual == SOURCE_HASHES
 
 
+@pytest.mark.skipif(
+    not PHASE07_RELEASE_INTEGRITY_REQUESTED,
+    reason=(
+        "trusted Phase 07 release integrity verification requires "
+        "ASSETGUARD_PHASE07_RELEASE_INTEGRITY=1"
+    ),
+)
 def test_expected_release_names_and_phase07_hashes_validate() -> None:
+    if not RELEASE_ARTIFACTS_AVAILABLE:
+        pytest.fail("trusted Phase 07 release artifacts are missing")
+
     artifacts, hashes = verifier.validate_release_integrity(PROJECT_ROOT)
 
     assert {path.name for path in artifacts.ordered_paths()} == set(verifier.EXPECTED_HASHES)
@@ -163,7 +223,7 @@ def test_checksum_parser_rejects_absolute_and_duplicate_names() -> None:
 def test_manifest_validation_rejects_wrong_contract(
     mutation: tuple[str, str, object], message: str
 ) -> None:
-    manifest = _manifest()
+    manifest = _synthetic_manifest()
     section, key, value = mutation
     manifest[section][key] = value  # type: ignore[index]
 
@@ -171,12 +231,9 @@ def test_manifest_validation_rejects_wrong_contract(
         verifier.validate_manifest(manifest, "0.1.0")
 
 
-def test_manifest_and_zip_validate_exact_phase07_payload() -> None:
-    payload = verifier.validate_manifest(_manifest(), "0.1.0")
-    verifier.validate_zip(
-        PROJECT_ROOT / "dist" / "release" / "AssetGuard-0.1.0-windows-x86_64.zip",
-        payload,
-    )
+def test_manifest_and_zip_validate_exact_synthetic_payload(tmp_path: Path) -> None:
+    payload = verifier.validate_manifest(_synthetic_manifest(), "0.1.0")
+    verifier.validate_zip(_write_synthetic_release_zip(tmp_path / "release.zip"), payload)
 
 
 @pytest.mark.parametrize("unsafe_name", ["../escape", "/absolute", "C:/drive"])
@@ -188,7 +245,10 @@ def test_zip_validation_rejects_non_exact_or_unsafe_names(
         output.writestr(unsafe_name, b"bad")
 
     with pytest.raises(verifier.VerificationError):
-        verifier.validate_zip(archive, verifier.validate_manifest(_manifest(), "0.1.0"))
+        verifier.validate_zip(
+            archive,
+            verifier.validate_manifest(_synthetic_manifest(), "0.1.0"),
+        )
 
 
 def test_generated_wsb_is_valid_isolated_two_mapping_xml() -> None:
