@@ -1,9 +1,11 @@
 import ast
 import getpass
+import io
 import json
 import os
 from pathlib import Path
 import re
+import runpy
 import subprocess
 import sys
 import tomllib
@@ -84,6 +86,16 @@ def test_entry_point_is_a_thin_existing_cli_launcher() -> None:
     source = ENTRY_POINT.read_text(encoding="utf-8")
     tree = ast.parse(source)
     imports = [node for node in tree.body if isinstance(node, ast.ImportFrom)]
+    main = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "main"
+    )
+    main_calls = [
+        ast.unparse(statement.value)
+        for statement in main.body
+        if isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Call)
+    ]
 
     assert [(node.module, [alias.name for alias in node.names]) for node in imports] == [
         ("assetguard.cli", ["app"])
@@ -91,6 +103,36 @@ def test_entry_point_is_a_thin_existing_cli_launcher() -> None:
     assert "argparse" not in source and "typer" not in source
     assert "__version__" not in source
     assert source.count("app()") == 1
+    assert main_calls == [
+        "_configure_utf8_stream(sys.stdout)",
+        "_configure_utf8_stream(sys.stderr)",
+        "app()",
+    ]
+
+
+def test_entry_point_reconfigures_legacy_stream_for_utf8_output() -> None:
+    namespace = runpy.run_path(str(ENTRY_POINT), run_name="assetguard_packaging_test")
+    configure = namespace["_configure_utf8_stream"]
+    sample = "звіт: C:\\дані\\результат.json"
+
+    legacy_bytes = io.BytesIO()
+    legacy_stream = io.TextIOWrapper(legacy_bytes, encoding="cp1252", errors="strict")
+    with pytest.raises(UnicodeEncodeError):
+        legacy_stream.write(sample)
+    legacy_stream.close()
+
+    utf8_bytes = io.BytesIO()
+    utf8_stream = io.TextIOWrapper(utf8_bytes, encoding="cp1252", errors="strict")
+    configure(utf8_stream)
+    assert utf8_stream.encoding == "utf-8"
+    assert utf8_stream.errors == "backslashreplace"
+    utf8_stream.write(sample)
+    utf8_stream.flush()
+    assert utf8_bytes.getvalue() == sample.encode("utf-8")
+    utf8_stream.detach().close()
+
+    configure(object())
+    configure(None)
 
 
 def test_spec_is_narrow_console_onefile_profile() -> None:
@@ -406,6 +448,117 @@ def test_built_executable_help_and_full_packaged_proof(tmp_path: Path) -> None:
     )
     assert proof.cache_hits == 2
     assert proof.json_equal and proof.html_equal and proof.assets_unchanged
+
+
+@pytest.mark.skipif(not INTEGRATION_ENABLED, reason="packaging integration not enabled")
+def test_built_executable_redirects_cyrillic_output_as_utf8_under_legacy_codepage(
+    tmp_path: Path,
+) -> None:
+    executable = _published_artifacts().executable.resolve()
+    assets = tmp_path / "активи"
+    assets.mkdir()
+    texture = assets / "T_текстура.png"
+    texture.write_bytes(build.deterministic_png())
+    config = tmp_path / "правила.yaml"
+    config.write_text(
+        """version: 1
+scan:
+  exclude_directories:
+    - .git
+naming:
+  enabled: true
+  severity: error
+  allowed_prefixes:
+    - T_
+textures:
+  enabled: true
+  severity: error
+  extensions:
+    - .png
+  require_power_of_two: true
+  max_width: 4096
+  max_height: 4096
+duplicates:
+  enabled: false
+  severity: warning
+""",
+        encoding="utf-8",
+        newline="\n",
+    )
+    report = tmp_path / "звіти" / "результат.json"
+    html_report = tmp_path / "звіти" / "результат.html"
+    cache = tmp_path / "кеш" / "метрики.sqlite3"
+    command = [
+        str(executable),
+        "scan",
+        str(assets.resolve()),
+        "--config",
+        str(config.resolve()),
+        "--output",
+        str(report.resolve()),
+        "--html-output",
+        str(html_report.resolve()),
+        "--cache",
+        str(cache.resolve()),
+        "--workers",
+        "4",
+    ]
+    environment = build.sanitized_runtime_environment(tmp_path / "runtime-temp")
+    environment["PYTHONUTF8"] = "0"
+    environment["PYTHONIOENCODING"] = "cp1252:strict"
+    initial_stat = texture.stat()
+    initial_asset = (
+        build.sha256_file(texture),
+        initial_stat.st_size,
+        initial_stat.st_mtime_ns,
+    )
+
+    first = subprocess.run(
+        command,
+        cwd=tmp_path,
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    first_stdout = first.stdout.decode("utf-8", errors="strict")
+    first_stderr = first.stderr.decode("utf-8", errors="strict")
+
+    assert first.returncode == 0
+    assert str(report.resolve()) in first_stdout
+    assert str(html_report.resolve()) in first_stdout
+    assert report.is_file() and html_report.is_file() and cache.is_file()
+    assert "Traceback" not in first_stderr
+    assert "UnicodeEncodeError" not in first_stderr
+    first_json = report.read_bytes()
+    first_html = html_report.read_bytes()
+
+    second = subprocess.run(
+        command,
+        cwd=tmp_path,
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    second_stdout = second.stdout.decode("utf-8", errors="strict")
+    second_stderr = second.stderr.decode("utf-8", errors="strict")
+    final_stat = texture.stat()
+    final_asset = (
+        build.sha256_file(texture),
+        final_stat.st_size,
+        final_stat.st_mtime_ns,
+    )
+
+    assert second.returncode == 0
+    assert "Cache hits: 1" in second_stdout
+    assert str(report.resolve()) in second_stdout
+    assert str(html_report.resolve()) in second_stdout
+    assert "Traceback" not in second_stderr
+    assert "UnicodeEncodeError" not in second_stderr
+    assert report.read_bytes() == first_json
+    assert html_report.read_bytes() == first_html
+    assert final_asset == initial_asset
 
 
 @pytest.mark.skipif(not INTEGRATION_ENABLED, reason="packaging integration not enabled")
