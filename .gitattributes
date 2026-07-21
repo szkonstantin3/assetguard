@@ -1,0 +1,17 @@
+*.py text eol=lf
+*.toml text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.md text eol=lf
+*.json text eol=lf
+*.spec text eol=lf
+*.txt text eol=lf
+
+*.exe binary
+*.dll binary
+*.pyd binary
+*.zip binary
+*.png binary
+*.tga binary
+*.sqlite binary
+*.sqlite3 binary

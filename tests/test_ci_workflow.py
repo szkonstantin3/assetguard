@@ -1,0 +1,307 @@
+from itertools import product
+from pathlib import Path
+import re
+from typing import Any, Iterator
+
+import yaml
+from yaml.nodes import MappingNode, Node, ScalarNode, SequenceNode
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+WORKFLOW_PATH = PROJECT_ROOT / ".github" / "workflows" / "ci.yml"
+CHECKOUT_ACTION = (
+    "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
+)
+SETUP_PYTHON_ACTION = (
+    "actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97"
+)
+EXPECTED_RUN_COMMANDS = [
+    'python -m pip install -e ".[dev]"',
+    "python -m pip check",
+    (
+        "python -m pytest -q --cov=assetguard --cov-report=term-missing "
+        "--cov-fail-under=90"
+    ),
+    "python -m assetguard --help",
+    "python -m assetguard scan --help",
+    "assetguard --help",
+    "assetguard scan --help",
+]
+
+
+def _workflow_text() -> str:
+    return WORKFLOW_PATH.read_text(encoding="utf-8")
+
+
+def _workflow() -> dict[str, Any]:
+    parsed = yaml.load(_workflow_text(), Loader=yaml.BaseLoader)
+    assert isinstance(parsed, dict)
+    return parsed
+
+
+def _job(name: str = "test") -> dict[str, Any]:
+    jobs = _workflow()["jobs"]
+    assert isinstance(jobs, dict)
+    job = jobs[name]
+    assert isinstance(job, dict)
+    return job
+
+
+def _steps(job_name: str = "test") -> list[dict[str, Any]]:
+    steps = _job(job_name)["steps"]
+    assert isinstance(steps, list)
+    assert all(isinstance(step, dict) for step in steps)
+    return steps
+
+
+def _all_steps() -> list[dict[str, Any]]:
+    return [step for job_name in _workflow()["jobs"] for step in _steps(job_name)]
+
+
+def _run_commands(job_name: str = "test") -> list[str]:
+    return [
+        line.strip()
+        for step in _steps(job_name)
+        for line in str(step.get("run", "")).splitlines()
+        if line.strip()
+    ]
+
+
+def _all_run_commands() -> list[str]:
+    return [
+        line.strip()
+        for step in _all_steps()
+        for line in str(step.get("run", "")).splitlines()
+        if line.strip()
+    ]
+
+
+def _scalar_values(value: Any) -> Iterator[str]:
+    if isinstance(value, dict):
+        for key, child in value.items():
+            yield str(key)
+            yield from _scalar_values(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from _scalar_values(child)
+    elif value is not None:
+        yield str(value)
+
+
+def _node_mapping(node: Node) -> dict[str, Node]:
+    assert isinstance(node, MappingNode)
+    return {
+        key.value: value
+        for key, value in node.value
+        if isinstance(key, ScalarNode)
+    }
+
+
+def test_workflow_exists_parses_and_has_expected_name() -> None:
+    assert WORKFLOW_PATH.is_file()
+    workflow = _workflow()
+
+    assert workflow["name"] == "AssetGuard CI"
+
+
+def test_workflow_file_is_portable_yaml_text() -> None:
+    raw = WORKFLOW_PATH.read_bytes()
+
+    assert raw.endswith(b"\n")
+    assert b"\r" not in raw
+    assert b"\t" not in raw
+
+
+def test_only_safe_required_triggers_are_enabled() -> None:
+    triggers = _workflow()["on"]
+    assert isinstance(triggers, dict)
+
+    assert set(triggers) == {"push", "pull_request", "workflow_dispatch"}
+    assert all(configuration in {None, ""} for configuration in triggers.values())
+    assert "pull_request_target" not in triggers
+    assert "workflow_run" not in triggers
+    assert "schedule" not in triggers
+
+
+def test_permissions_are_exactly_read_only() -> None:
+    workflow = _workflow()
+    scalar_values = {value.lower() for value in _scalar_values(workflow)}
+
+    assert workflow["permissions"] == {"contents": "read"}
+    assert {"write", "write-all"}.isdisjoint(scalar_values)
+    assert workflow["env"] == {
+        "PIP_DISABLE_PIP_VERSION_CHECK": "1",
+        "PYTHONUTF8": "1",
+    }
+
+
+def test_concurrency_cancels_superseded_runs_per_workflow_and_ref() -> None:
+    concurrency = _workflow()["concurrency"]
+    assert isinstance(concurrency, dict)
+
+    assert "${{ github.workflow }}" in concurrency["group"]
+    assert "${{ github.ref }}" in concurrency["group"]
+    assert concurrency["cancel-in-progress"] == "true"
+
+
+def test_exact_four_leg_matrix_and_bounded_job_are_declared() -> None:
+    workflow = _workflow()
+    jobs = workflow["jobs"]
+    assert isinstance(jobs, dict)
+    assert set(jobs) == {"test", "package-windows"}
+
+    job = _job()
+    strategy = job["strategy"]
+    assert isinstance(strategy, dict)
+    matrix = strategy["matrix"]
+    assert isinstance(matrix, dict)
+    assert matrix["os"] == ["ubuntu-latest", "windows-latest"]
+    assert matrix["python-version"] == ["3.12", "3.13"]
+    assert list(product(matrix["os"], matrix["python-version"])) == [
+        ("ubuntu-latest", "3.12"),
+        ("ubuntu-latest", "3.13"),
+        ("windows-latest", "3.12"),
+        ("windows-latest", "3.13"),
+    ]
+    assert strategy["fail-fast"] == "false"
+    assert job["name"] == "Test (${{ matrix.os }}, Python ${{ matrix.python-version }})"
+    assert job["runs-on"] == "${{ matrix.os }}"
+    assert 1 <= int(job["timeout-minutes"]) <= 60
+
+
+def test_python_matrix_versions_are_explicitly_quoted_strings() -> None:
+    document = yaml.compose(_workflow_text(), Loader=yaml.BaseLoader)
+    assert document is not None
+    root = _node_mapping(document)
+    jobs = _node_mapping(root["jobs"])
+    test_job = _node_mapping(jobs["test"])
+    strategy = _node_mapping(test_job["strategy"])
+    matrix = _node_mapping(strategy["matrix"])
+    versions = matrix["python-version"]
+    assert isinstance(versions, SequenceNode)
+
+    assert [node.value for node in versions.value] == ["3.12", "3.13"]
+    assert all(
+        isinstance(node, ScalarNode) and node.style in {"'", '"'}
+        for node in versions.value
+    )
+
+
+def test_only_required_full_sha_action_references_are_used() -> None:
+    action_references = [step["uses"] for step in _all_steps() if "uses" in step]
+
+    assert action_references == [
+        CHECKOUT_ACTION,
+        SETUP_PYTHON_ACTION,
+        CHECKOUT_ACTION,
+        SETUP_PYTHON_ACTION,
+    ]
+    assert all(
+        re.fullmatch(r"actions/[a-z-]+@[0-9a-f]{40}", reference)
+        for reference in action_references
+    )
+    raw = _workflow_text()
+    assert f"{CHECKOUT_ACTION} # v7.0.1" in raw
+    assert f"{SETUP_PYTHON_ACTION} # v7.0.0" in raw
+
+
+def test_checkout_does_not_persist_credentials() -> None:
+    checkouts = [step for step in _all_steps() if step.get("uses") == CHECKOUT_ACTION]
+
+    assert len(checkouts) == 2
+    assert all(
+        checkout["with"] == {"persist-credentials": "false"}
+        for checkout in checkouts
+    )
+
+
+def test_setup_python_uses_matrix_version_and_pip_cache() -> None:
+    setup = next(step for step in _steps() if step.get("uses") == SETUP_PYTHON_ACTION)
+
+    assert setup["with"] == {
+        "python-version": "${{ matrix.python-version }}",
+        "cache": "pip",
+        "cache-dependency-path": "pyproject.toml",
+    }
+
+
+def test_install_dependency_check_coverage_gate_and_cli_smokes_are_exact() -> None:
+    commands = _run_commands()
+
+    assert commands == EXPECTED_RUN_COMMANDS
+    test_command = commands[2]
+    assert test_command.startswith("python -m pytest ")
+    assert "--cov=assetguard" in test_command.split()
+    assert "--cov-report=term-missing" in test_command.split()
+    assert re.findall(r"--cov-fail-under(?:=|\s+)(\d+)", test_command) == ["90"]
+    assert commands[-4:] == EXPECTED_RUN_COMMANDS[-4:]
+
+
+def test_workflow_has_no_continue_on_error_secrets_or_extra_execution() -> None:
+    workflow = _workflow()
+    scalar_values = [value.lower() for value in _scalar_values(workflow)]
+    raw_lower = _workflow_text().lower()
+
+    assert "continue-on-error" not in scalar_values
+    assert "secrets." not in raw_lower
+    assert "${{ secrets" not in raw_lower
+    assert _run_commands() == EXPECTED_RUN_COMMANDS
+
+
+def test_run_steps_contain_no_write_or_publication_commands() -> None:
+    run_text = "\n".join(_all_run_commands()).lower()
+    forbidden_patterns = [
+        r"\bgit\s+(?:add|commit|push|tag|checkout|reset|clean)\b",
+        r"\b(?:publish|release|twine|upload|deploy)\b",
+        r"\b(?:curl|wget|invoke-webrequest)\b",
+    ]
+
+    assert all(re.search(pattern, run_text) is None for pattern in forbidden_patterns)
+
+
+def test_no_artifact_or_unapproved_third_party_action_is_referenced() -> None:
+    action_references = [step["uses"] for step in _all_steps() if "uses" in step]
+
+    assert set(action_references) == {CHECKOUT_ACTION, SETUP_PYTHON_ACTION}
+    assert all("artifact" not in reference.lower() for reference in action_references)
+
+
+def test_windows_packaging_job_preserves_security_and_exact_contract() -> None:
+    job = _job("package-windows")
+    steps = _steps("package-windows")
+    setup = next(step for step in steps if step.get("uses") == SETUP_PYTHON_ACTION)
+
+    assert job["needs"] == "test"
+    assert job["runs-on"] == "windows-latest"
+    assert job["timeout-minutes"] == "30"
+    assert setup["with"] == {
+        "python-version": "3.13.9",
+        "cache": "pip",
+        "cache-dependency-path": "pyproject.toml",
+    }
+    assert 'python-version: "3.13.9"' in _workflow_text()
+    assert _run_commands("package-windows") == [
+        'python -m pip install -e ".[dev,build]"',
+        "python -m pip check",
+        "python tools/build_windows_release.py --verify-reproducible",
+        "python -m pytest -q tests/test_windows_packaging.py",
+    ]
+    packaging_test = next(
+        step
+        for step in steps
+        if step.get("run") == "python -m pytest -q tests/test_windows_packaging.py"
+    )
+    assert packaging_test["env"] == {"ASSETGUARD_PACKAGING_INTEGRATION": "1"}
+
+
+def test_packaging_job_has_no_upload_release_signing_or_secrets() -> None:
+    raw = _workflow_text().lower()
+    packaging_commands = "\n".join(_run_commands("package-windows")).lower()
+
+    assert "upload-artifact" not in raw
+    assert "download-artifact" not in raw
+    assert "${{ secrets" not in raw
+    assert all(
+        token not in packaging_commands
+        for token in ("git push", "git commit", "git tag", "twine", "signtool")
+    )

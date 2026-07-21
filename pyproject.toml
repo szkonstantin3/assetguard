@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "assetguard"
+version = "0.1.0"
+description = "Deterministic validation and duplicate detection for game asset directories."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "Pillow>=11.0",
+    "pydantic>=2.10",
+    "PyYAML>=6.0",
+    "typer>=0.15",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3",
+    "pytest-cov>=6.0",
+]
+build = [
+    "pyinstaller==6.21.0",
+    "pyinstaller-hooks-contrib==2026.6",
+]
+
+[project.scripts]
+assetguard = "assetguard.cli:app"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

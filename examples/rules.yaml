@@ -1,0 +1,42 @@
+version: 1
+
+scan:
+  exclude_directories:
+    - .git
+    - .venv
+    - __pycache__
+
+naming:
+  enabled: true
+  severity: error
+  allowed_prefixes:
+    - T_
+    - M_
+    - MI_
+    - SM_
+    - SK_
+    - BP_
+
+textures:
+  enabled: true
+  severity: error
+  extensions:
+    - .png
+    - .tga
+  require_power_of_two: true
+  max_width: 4096
+  max_height: 4096
+
+meshes:
+  enabled: true
+  severity: error
+  extensions:
+    - .obj
+  require_triangulated: true
+  require_uv: true
+  max_triangles: 100000
+  max_material_slots: 8
+
+duplicates:
+  enabled: true
+  severity: warning
