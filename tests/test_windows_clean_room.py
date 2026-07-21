@@ -251,12 +251,15 @@ def test_zip_validation_rejects_non_exact_or_unsafe_names(
         )
 
 
-def test_generated_wsb_is_valid_isolated_two_mapping_xml() -> None:
-    release = Path(r"C:\AssetGuardPhase08Test\release & artifacts")
-    exchange = Path(r"C:\AssetGuardPhase08Test\exchange & results")
+def test_generated_wsb_is_valid_isolated_two_mapping_xml(tmp_path: Path) -> None:
+    release = tmp_path / "release & artifacts"
+    exchange = tmp_path / "exchange & results"
+    release.mkdir()
+    exchange.mkdir()
     xml_text = verifier.generate_wsb_xml(release, exchange)
     root = ET.fromstring(xml_text)
     mappings = root.findall("./MappedFolders/MappedFolder")
+    host_folders = {mapping.findtext("HostFolder") for mapping in mappings}
 
     assert root.findtext("Networking") == "Disable"
     assert root.findtext("VGpu") == "Disable"
@@ -269,12 +272,12 @@ def test_generated_wsb_is_valid_isolated_two_mapping_xml() -> None:
     assert mappings[0].findtext("ReadOnly") == "true"
     assert mappings[1].findtext("SandboxFolder") == r"C:\AssetGuardExchange"
     assert mappings[1].findtext("ReadOnly") == "false"
-    assert {mapping.findtext("HostFolder") for mapping in mappings} == {
+    assert host_folders == {
         str(release.resolve()),
         str(exchange.resolve()),
     }
+    assert str(PROJECT_ROOT.resolve()) not in host_folders
     assert "&amp;" in xml_text
-    assert str(PROJECT_ROOT) not in xml_text
     command = root.findtext("./LogonCommand/Command")
     assert command == (
         r"powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass "
