@@ -13,6 +13,9 @@ concurrency:
   cancel-in-progress: true
 
 env:
+  GIT_CONFIG_COUNT: "1"
+  GIT_CONFIG_KEY_0: core.autocrlf
+  GIT_CONFIG_VALUE_0: "false"
   PIP_DISABLE_PIP_VERSION_CHECK: "1"
   PYTHONUTF8: "1"
 
@@ -43,24 +46,33 @@ jobs:
           cache: pip
           cache-dependency-path: pyproject.toml
 
-      - name: Install development dependencies
-        run: python -m pip install -e ".[dev]"
+      - name: Install uv
+        run: python -m pip install uv==0.11.28
 
-      - name: Validate installed dependencies
-        run: python -m pip check
+      - name: Verify uv version
+        run: uv --version
+
+      - name: Validate dependency lock
+        run: uv lock --check
+
+      - name: Synchronize locked development dependencies
+        run: uv sync --locked --extra dev --python ${{ matrix.python-version }}
+
+      - name: Validate locked dependencies
+        run: uv pip check
 
       - name: Run tests with coverage gate
-        run: python -m pytest -q --cov=assetguard --cov-report=term-missing --cov-fail-under=90
+        run: uv run --locked --no-sync python -m pytest -q --cov=assetguard --cov-report=term-missing --cov-fail-under=90
 
       - name: Smoke test module CLI
         run: |
-          python -m assetguard --help
-          python -m assetguard scan --help
+          uv run --locked --no-sync python -m assetguard --help
+          uv run --locked --no-sync python -m assetguard scan --help
 
       - name: Smoke test installed CLI
         run: |
-          assetguard --help
-          assetguard scan --help
+          uv run --locked --no-sync assetguard --help
+          uv run --locked --no-sync assetguard scan --help
 
   package-windows:
     name: Package (windows-latest, Python 3.13.9)
@@ -80,16 +92,25 @@ jobs:
           cache: pip
           cache-dependency-path: pyproject.toml
 
-      - name: Install packaging dependencies
-        run: python -m pip install -e ".[dev,build]"
+      - name: Install uv
+        run: python -m pip install uv==0.11.28
 
-      - name: Validate installed dependencies
-        run: python -m pip check
+      - name: Verify uv version
+        run: uv --version
+
+      - name: Validate dependency lock
+        run: uv lock --check
+
+      - name: Synchronize locked packaging dependencies
+        run: uv sync --locked --extra dev --extra build --python 3.13.9
+
+      - name: Validate locked dependencies
+        run: uv pip check
 
       - name: Build and prove repeatable release
-        run: python tools/build_windows_release.py --verify-reproducible
+        run: uv run --locked --no-sync python tools/build_windows_release.py --verify-reproducible
 
       - name: Validate packaged artifacts
         env:
           ASSETGUARD_PACKAGING_INTEGRATION: "1"
-        run: python -m pytest -q tests/test_windows_packaging.py
+        run: uv run --locked --no-sync python -m pytest -q tests/test_windows_packaging.py

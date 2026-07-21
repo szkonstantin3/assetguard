@@ -184,26 +184,42 @@ python -m pytest -q
 python -m pytest --cov=assetguard --cov-report=term-missing
 ```
 
+## Dependency lock
+
+The committed `uv.lock` is the authoritative exact dependency resolution for Linux CPython 3.12 and 3.13 and Windows CPython 3.12 and 3.13. Install and validate it with exactly uv 0.11.28:
+
+```powershell
+python -m pip install uv==0.11.28
+uv lock --check
+uv sync --locked --extra dev
+uv pip check
+uv sync --locked --extra dev --extra build
+```
+
+Application dependency ranges remain declared in `pyproject.toml`; exact resolved runtime, development, and Windows-build versions and distribution hashes live in `uv.lock`. Lock updates must be deliberate and reviewed. Hosted CI installs exact uv 0.11.28, checks the lock, synchronizes with `uv sync --locked`, validates the environment with `uv pip check`, and runs commands with `uv run --locked --no-sync`. The test matrix synchronizes the locked `dev` extra; Windows packaging synchronizes both the locked `dev` and `build` extras.
+
 ## Windows executable
 
 Phase 07 defines a Windows x86_64/AMD64 one-file console build using exactly CPython 3.13.9, PyInstaller 6.21.0, and pyinstaller-hooks-contrib 2026.6. The build profile rejects a different operating system, architecture, Python patch version, or PyInstaller toolchain before generating artifacts. Install the dedicated development and build extras without adding PyInstaller to AssetGuard's runtime dependencies:
 
 ```powershell
-python -m pip install -e ".[dev,build]"
-python -m pip check
+python -m pip install uv==0.11.28
+uv lock --check
+uv sync --locked --extra dev --extra build --python 3.13.9
+uv pip check
 ```
 
 Create one locally validated artifact set:
 
 ```powershell
-python tools/build_windows_release.py
+uv run --locked --no-sync python tools/build_windows_release.py
 ```
 
 Build two independent clean copies with the controlled toolchain and require byte-identical executable, ZIP, manifest, and checksum outputs before publication into `dist/release`:
 
 ```powershell
-python tools/build_windows_release.py --verify-reproducible
-python -m pytest -q tests/test_windows_packaging.py
+uv run --locked --no-sync python tools/build_windows_release.py --verify-reproducible
+uv run --locked --no-sync python -m pytest -q tests/test_windows_packaging.py
 ```
 
 The release directory contains exactly these versioned files for version `0.1.0`:
@@ -237,7 +253,7 @@ One test job expands to a four-leg matrix:
 - Windows (`windows-latest`) with Python 3.12;
 - Windows (`windows-latest`) with Python 3.13.
 
-Every leg installs the editable development project, checks dependency consistency with `pip check`, runs the full test suite with a 90% coverage gate, and smoke-tests both the module and installed `assetguard` entry points. Repository permission is limited to `contents: read`, checkout credentials are not persisted, and the only external actions are official GitHub actions pinned to immutable commits:
+Every leg installs exact uv 0.11.28, validates `uv.lock`, synchronizes the locked `dev` extra for its matrix Python, checks dependency consistency with `uv pip check`, runs the full test suite with a 90% coverage gate, and smoke-tests both the module and installed `assetguard` entry points through `uv run --locked --no-sync`. The workflow disables Git's automatic CRLF conversion through scoped process configuration so the lock bytes remain identical on Windows and Linux. Repository permission is limited to `contents: read`, checkout credentials are not persisted, and the only external actions are official GitHub actions pinned to immutable commits:
 
 - `actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1` (`v7.0.1`);
 - `actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97` (`v7.0.0`).
@@ -245,30 +261,32 @@ Every leg installs the editable development project, checks dependency consisten
 The local equivalent commands are:
 
 ```powershell
-python -m pip install -e ".[dev]"
-python -m pip check
-python -m pytest -q --cov=assetguard --cov-report=term-missing --cov-fail-under=90
-python -m assetguard --help
-python -m assetguard scan --help
-assetguard --help
-assetguard scan --help
+python -m pip install uv==0.11.28
+uv --version
+uv lock --check
+uv sync --locked --extra dev --python 3.13.9
+uv pip check
+uv run --locked --no-sync python -m pytest -q --cov=assetguard --cov-report=term-missing --cov-fail-under=90
+uv run --locked --no-sync python -m assetguard --help
+uv run --locked --no-sync python -m assetguard scan --help
+uv run --locked --no-sync assetguard --help
+uv run --locked --no-sync assetguard scan --help
 ```
 
-The workflow file is prepared and contract-tested locally. It cannot be described as successfully executed on GitHub until AssetGuard is placed in a valid GitHub repository and a hosted run completes. A CI badge should not be added before a real repository URL and successful hosted run exist.
+The locked workflow configuration is contract-tested locally. Its cross-platform status is established only by a completed GitHub-hosted run for the exact commit being evaluated; no CI badge is maintained in this phase.
 
-A dependent `package-windows` job uses Windows and Python 3.13.9 to install `.[dev,build]`, verify dependencies, run the two-build reproducibility proof, and inspect the generated artifacts. It does not upload, sign, release, or publish them. This hosted packaging job also remains unverified until an actual GitHub Actions run completes.
+A dependent `package-windows` job uses Windows and Python 3.13.9 to synchronize the locked `dev` and `build` extras, verify dependencies, run the two-build reproducibility proof, and inspect the generated artifacts through `uv run --locked --no-sync`. It does not upload, sign, release, or publish them.
 
 ## Current limitations
 
 Phase 07 supports only OBJ meshes and does not validate referenced index ranges. It has no multiprocessing, automatic worker selection, parallel SQLite access, or metadata-only cache shortcut. Candidate file bytes are still read for SHA-256 on every applicable scan. Concurrent modification of assets during a scan is unsupported, and performance depends on the filesystem and asset types.
 
-The HTML report is static and has no interactive filtering, charts, PDF export, historical analytics, or live asset links. The cache has no pruning, migration, parallel-access guarantee, or repair command. AssetGuard has no GUI, asset repair or conversion, other mesh formats, full filesystem incremental skipping, Blender integration, or engine integration. The executable has no installer or code signature and has not been validated on a separate clean Windows machine. The prepared workflow has not yet run on GitHub-hosted Windows, Linux, or Python 3.12 environments.
+The HTML report is static and has no interactive filtering, charts, PDF export, historical analytics, or live asset links. The cache has no pruning, migration, parallel-access guarantee, or repair command. AssetGuard has no GUI, asset repair or conversion, other mesh formats, full filesystem incremental skipping, Blender integration, or engine integration. The executable has no installer or code signature. Hosted results remain commit-specific, and local validation alone does not prove every supported runner and Python combination.
 
 ## Roadmap
 
-- Real hosted CI verification
 - Clean Windows-machine executable verification
-- Dependency locking and SBOM
+- SBOM generation
 - Code signing
 - Explicitly authorized artifact publication
 - Broader mesh-format support

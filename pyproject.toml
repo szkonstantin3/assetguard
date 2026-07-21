@@ -28,6 +28,15 @@ build = [
 [project.scripts]
 assetguard = "assetguard.cli:app"
 
+[tool.uv]
+required-version = "==0.11.28"
+environments = [
+    "sys_platform == 'linux' and implementation_name == 'cpython' and python_version == '3.12'",
+    "sys_platform == 'linux' and implementation_name == 'cpython' and python_version == '3.13'",
+    "sys_platform == 'win32' and implementation_name == 'cpython' and python_version == '3.12'",
+    "sys_platform == 'win32' and implementation_name == 'cpython' and python_version == '3.13'",
+]
+
 [tool.setuptools.packages.find]
 where = ["src"]
 

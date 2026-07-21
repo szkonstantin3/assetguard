@@ -15,17 +15,35 @@ CHECKOUT_ACTION = (
 SETUP_PYTHON_ACTION = (
     "actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97"
 )
-EXPECTED_RUN_COMMANDS = [
-    'python -m pip install -e ".[dev]"',
-    "python -m pip check",
+TEST_RUN_COMMANDS = [
+    "python -m pip install uv==0.11.28",
+    "uv --version",
+    "uv lock --check",
+    "uv sync --locked --extra dev --python ${{ matrix.python-version }}",
+    "uv pip check",
     (
-        "python -m pytest -q --cov=assetguard --cov-report=term-missing "
-        "--cov-fail-under=90"
+        "uv run --locked --no-sync python -m pytest -q --cov=assetguard "
+        "--cov-report=term-missing --cov-fail-under=90"
     ),
-    "python -m assetguard --help",
-    "python -m assetguard scan --help",
-    "assetguard --help",
-    "assetguard scan --help",
+    "uv run --locked --no-sync python -m assetguard --help",
+    "uv run --locked --no-sync python -m assetguard scan --help",
+    "uv run --locked --no-sync assetguard --help",
+    "uv run --locked --no-sync assetguard scan --help",
+]
+PACKAGE_RUN_COMMANDS = [
+    "python -m pip install uv==0.11.28",
+    "uv --version",
+    "uv lock --check",
+    "uv sync --locked --extra dev --extra build --python 3.13.9",
+    "uv pip check",
+    (
+        "uv run --locked --no-sync python tools/build_windows_release.py "
+        "--verify-reproducible"
+    ),
+    (
+        "uv run --locked --no-sync python -m pytest -q "
+        "tests/test_windows_packaging.py"
+    ),
 ]
 
 
@@ -130,6 +148,9 @@ def test_permissions_are_exactly_read_only() -> None:
     assert workflow["permissions"] == {"contents": "read"}
     assert {"write", "write-all"}.isdisjoint(scalar_values)
     assert workflow["env"] == {
+        "GIT_CONFIG_COUNT": "1",
+        "GIT_CONFIG_KEY_0": "core.autocrlf",
+        "GIT_CONFIG_VALUE_0": "false",
         "PIP_DISABLE_PIP_VERSION_CHECK": "1",
         "PYTHONUTF8": "1",
     }
@@ -225,16 +246,44 @@ def test_setup_python_uses_matrix_version_and_pip_cache() -> None:
     }
 
 
-def test_install_dependency_check_coverage_gate_and_cli_smokes_are_exact() -> None:
+def test_locked_sync_dependency_check_coverage_gate_and_cli_smokes_are_exact() -> None:
     commands = _run_commands()
 
-    assert commands == EXPECTED_RUN_COMMANDS
-    test_command = commands[2]
-    assert test_command.startswith("python -m pytest ")
+    assert commands == TEST_RUN_COMMANDS
+    test_command = commands[5]
+    assert test_command.startswith("uv run --locked --no-sync python -m pytest ")
     assert "--cov=assetguard" in test_command.split()
     assert "--cov-report=term-missing" in test_command.split()
     assert re.findall(r"--cov-fail-under(?:=|\s+)(\d+)", test_command) == ["90"]
-    assert commands[-4:] == EXPECTED_RUN_COMMANDS[-4:]
+    assert commands[-4:] == TEST_RUN_COMMANDS[-4:]
+
+
+def test_every_project_command_enforces_the_exact_locked_uv_environment() -> None:
+    test_commands = _run_commands("test")
+    package_commands = _run_commands("package-windows")
+    all_commands = test_commands + package_commands
+
+    assert test_commands == TEST_RUN_COMMANDS
+    assert package_commands == PACKAGE_RUN_COMMANDS
+    assert [command for command in all_commands if command.startswith("python -m pip install")] == [
+        "python -m pip install uv==0.11.28",
+        "python -m pip install uv==0.11.28",
+    ]
+    assert "python -m pip check" not in all_commands
+    assert [command for command in all_commands if command.startswith("uv lock")] == [
+        "uv lock --check",
+        "uv lock --check",
+    ]
+    sync_commands = [command for command in all_commands if command.startswith("uv sync")]
+    assert sync_commands == [TEST_RUN_COMMANDS[3], PACKAGE_RUN_COMMANDS[3]]
+    assert all("--locked" in command.split() for command in sync_commands)
+    assert "--extra build" not in test_commands[3]
+    assert "--extra build" in package_commands[3]
+    uv_runs = [command for command in all_commands if command.startswith("uv run")]
+    assert uv_runs
+    assert all(
+        {"--locked", "--no-sync"} <= set(command.split()) for command in uv_runs
+    )
 
 
 def test_workflow_has_no_continue_on_error_secrets_or_extra_execution() -> None:
@@ -245,7 +294,7 @@ def test_workflow_has_no_continue_on_error_secrets_or_extra_execution() -> None:
     assert "continue-on-error" not in scalar_values
     assert "secrets." not in raw_lower
     assert "${{ secrets" not in raw_lower
-    assert _run_commands() == EXPECTED_RUN_COMMANDS
+    assert _run_commands() == TEST_RUN_COMMANDS
 
 
 def test_run_steps_contain_no_write_or_publication_commands() -> None:
@@ -280,16 +329,11 @@ def test_windows_packaging_job_preserves_security_and_exact_contract() -> None:
         "cache-dependency-path": "pyproject.toml",
     }
     assert 'python-version: "3.13.9"' in _workflow_text()
-    assert _run_commands("package-windows") == [
-        'python -m pip install -e ".[dev,build]"',
-        "python -m pip check",
-        "python tools/build_windows_release.py --verify-reproducible",
-        "python -m pytest -q tests/test_windows_packaging.py",
-    ]
+    assert _run_commands("package-windows") == PACKAGE_RUN_COMMANDS
     packaging_test = next(
         step
         for step in steps
-        if step.get("run") == "python -m pytest -q tests/test_windows_packaging.py"
+        if step.get("run") == PACKAGE_RUN_COMMANDS[-1]
     )
     assert packaging_test["env"] == {"ASSETGUARD_PACKAGING_INTEGRATION": "1"}
 

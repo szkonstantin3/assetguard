@@ -692,6 +692,7 @@ def source_input_paths(project_root: Path) -> list[Path]:
 
     paths = [
         Path("pyproject.toml"),
+        Path("uv.lock"),
         Path("README.md"),
         Path("examples/rules.yaml"),
         Path("packaging/windows/assetguard_entry.py"),

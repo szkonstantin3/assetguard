@@ -284,6 +284,17 @@ def test_source_digest_is_deterministic_and_content_sensitive(tmp_path: Path) ->
     assert build.calculate_source_digest(tmp_path, paths) != digest
 
 
+def test_source_digest_changes_when_lock_bytes_change(tmp_path: Path) -> None:
+    lock = tmp_path / "uv.lock"
+    lock.write_bytes(b"version = 1\n")
+    paths = [Path("uv.lock")]
+    digest = build.calculate_source_digest(tmp_path, paths)
+
+    lock.write_bytes(b"version = 2\n")
+
+    assert build.calculate_source_digest(tmp_path, paths) != digest
+
+
 def test_source_digest_input_set_contains_all_required_classes() -> None:
     relative = [path.as_posix() for path in build.source_input_paths(PROJECT_ROOT)]
 
@@ -291,6 +302,7 @@ def test_source_digest_input_set_contains_all_required_classes() -> None:
     assert "packaging/windows/assetguard_entry.py" in relative
     assert "pyproject.toml" in relative
     assert "tools/build_windows_release.py" in relative
+    assert relative.count("uv.lock") == 1
     assert "src/assetguard/cli.py" in relative
     assert all(not Path(path).is_absolute() for path in relative)
 
@@ -388,17 +400,44 @@ def test_reproducibility_mismatch_does_not_publish(
     assert not (tmp_path / "dist" / "release").exists()
 
 
-def test_ci_contains_read_only_dependent_windows_packaging_job() -> None:
+def test_ci_contains_locked_read_only_dependent_windows_packaging_job() -> None:
     workflow = yaml.load(WORKFLOW.read_text(encoding="utf-8"), Loader=yaml.BaseLoader)
     package_job = workflow["jobs"]["package-windows"]
-    run_text = "\n".join(
-        step.get("run", "") for step in package_job["steps"] if isinstance(step, dict)
-    )
+    commands = [
+        line.strip()
+        for step in package_job["steps"]
+        if isinstance(step, dict)
+        for line in step.get("run", "").splitlines()
+        if line.strip()
+    ]
+    expected = [
+        "python -m pip install uv==0.11.28",
+        "uv --version",
+        "uv lock --check",
+        "uv sync --locked --extra dev --extra build --python 3.13.9",
+        "uv pip check",
+        (
+            "uv run --locked --no-sync python tools/build_windows_release.py "
+            "--verify-reproducible"
+        ),
+        (
+            "uv run --locked --no-sync python -m pytest -q "
+            "tests/test_windows_packaging.py"
+        ),
+    ]
 
     assert workflow["permissions"] == {"contents": "read"}
     assert package_job["needs"] == "test"
     assert package_job["runs-on"] == "windows-latest"
-    assert "python tools/build_windows_release.py --verify-reproducible" in run_text
+    assert commands == expected
+    integration_step = next(
+        step for step in package_job["steps"] if step.get("run") == expected[-1]
+    )
+    assert integration_step["env"] == {"ASSETGUARD_PACKAGING_INTEGRATION": "1"}
+    assert 'python -m pip install -e ".[dev,build]"' not in WORKFLOW.read_text(
+        encoding="utf-8"
+    )
+    assert "python -m pip check" not in commands
     assert "upload-artifact" not in WORKFLOW.read_text(encoding="utf-8")
     assert "${{ secrets" not in WORKFLOW.read_text(encoding="utf-8")
 
