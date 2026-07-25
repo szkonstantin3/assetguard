@@ -403,13 +403,13 @@ def test_reproducibility_mismatch_does_not_publish(
 def test_ci_contains_locked_read_only_dependent_windows_packaging_job() -> None:
     workflow = yaml.load(WORKFLOW.read_text(encoding="utf-8"), Loader=yaml.BaseLoader)
     package_job = workflow["jobs"]["package-windows"]
-    commands = [
-        line.strip()
+    run_steps = [
+        step
         for step in package_job["steps"]
         if isinstance(step, dict)
-        for line in step.get("run", "").splitlines()
-        if line.strip()
+        if str(step.get("run", "")).strip()
     ]
+    actual_run_commands = [str(step["run"]).strip() for step in run_steps]
     expected = [
         "python -m pip install uv==0.11.28",
         "uv --version",
@@ -429,15 +429,29 @@ def test_ci_contains_locked_read_only_dependent_windows_packaging_job() -> None:
     assert workflow["permissions"] == {"contents": "read"}
     assert package_job["needs"] == "test"
     assert package_job["runs-on"] == "windows-latest"
-    assert commands == expected
+    assert len(actual_run_commands) == 8
+    assert actual_run_commands[0:7] == expected
     integration_step = next(
         step for step in package_job["steps"] if step.get("run") == expected[-1]
+    )
+    supply_chain_steps = [
+        step
+        for step in package_job["steps"]
+        if step.get("name")
+        == "Generate and verify deterministic supply-chain metadata"
+    ]
+    assert len(supply_chain_steps) == 1
+    supply_chain_step = supply_chain_steps[0]
+    assert run_steps[7] is supply_chain_step
+    assert actual_run_commands[7] == str(supply_chain_step["run"]).strip()
+    assert package_job["steps"].index(supply_chain_step) > package_job["steps"].index(
+        integration_step
     )
     assert integration_step["env"] == {"ASSETGUARD_PACKAGING_INTEGRATION": "1"}
     assert 'python -m pip install -e ".[dev,build]"' not in WORKFLOW.read_text(
         encoding="utf-8"
     )
-    assert "python -m pip check" not in commands
+    assert "python -m pip check" not in actual_run_commands
     assert "upload-artifact" not in WORKFLOW.read_text(encoding="utf-8")
     assert "${{ secrets" not in WORKFLOW.read_text(encoding="utf-8")
 

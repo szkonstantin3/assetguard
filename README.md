@@ -242,6 +242,18 @@ The reproducibility claim is deliberately limited to a **same-toolchain byte-rep
 
 There is no installer, code signature, remote upload, or artifact publication in this phase. A separate clean Windows-machine compatibility test is still required before public distribution. Final files are individually published through temporary siblings and atomic replacement where practical, but the four-file publication is not transactionally atomic as a group.
 
+## Supply-chain metadata
+
+After validating a current four-file Windows release, generate deterministic local metadata with exact uv 0.11.28:
+
+```powershell
+uv run --locked --no-sync python tools/generate_supply_chain.py --release-dir dist/release --output-dir build/supply-chain/local --source-commit <40-lowercase-commit-sha>
+```
+
+The output directory contains `AssetGuard-0.1.0-runtime.cdx.json`, `AssetGuard-0.1.0-all-extras.cdx.json`, `AssetGuard-0.1.0-windows-x86_64.provenance.json`, and `AssetGuard-0.1.0-supply-chain.sha256`. The runtime CycloneDX 1.5 SBOM contains application dependencies; the all-extras SBOM also contains declared development and Windows-build dependencies. Provenance is unsigned local metadata; no SLSA level or signature is claimed. Generation does not upload or publish artifacts.
+
+See [Supply-chain metadata](docs/supply-chain.md) for the deterministic format and build-type contract, and [Dependency update policy](docs/dependency-update-policy.md) for deliberate lock maintenance.
+
 ## Continuous integration
 
 The locally prepared workflow is stored at `.github/workflows/ci.yml`. It is configured for unrestricted `push` and `pull_request` events plus manual `workflow_dispatch` runs, without assuming a future default branch name. Superseded runs for the same workflow and Git reference are cancelled.
@@ -286,7 +298,6 @@ The HTML report is static and has no interactive filtering, charts, PDF export, 
 ## Roadmap
 
 - Clean Windows-machine executable verification
-- SBOM generation
 - Code signing
 - Explicitly authorized artifact publication
 - Broader mesh-format support

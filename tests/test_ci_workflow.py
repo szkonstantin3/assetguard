@@ -45,6 +45,13 @@ PACKAGE_RUN_COMMANDS = [
         "tests/test_windows_packaging.py"
     ),
 ]
+SUPPLY_CHAIN_STEP_NAME = "Generate and verify deterministic supply-chain metadata"
+SUPPLY_CHAIN_FILENAMES = {
+    "AssetGuard-0.1.0-all-extras.cdx.json",
+    "AssetGuard-0.1.0-runtime.cdx.json",
+    "AssetGuard-0.1.0-supply-chain.sha256",
+    "AssetGuard-0.1.0-windows-x86_64.provenance.json",
+}
 
 
 def _workflow_text() -> str:
@@ -74,6 +81,12 @@ def _steps(job_name: str = "test") -> list[dict[str, Any]]:
 
 def _all_steps() -> list[dict[str, Any]]:
     return [step for job_name in _workflow()["jobs"] for step in _steps(job_name)]
+
+
+def _step_named(name: str, job_name: str = "package-windows") -> dict[str, Any]:
+    matching = [step for step in _steps(job_name) if step.get("name") == name]
+    assert len(matching) == 1
+    return matching[0]
 
 
 def _run_commands(job_name: str = "test") -> list[str]:
@@ -264,7 +277,7 @@ def test_every_project_command_enforces_the_exact_locked_uv_environment() -> Non
     all_commands = test_commands + package_commands
 
     assert test_commands == TEST_RUN_COMMANDS
-    assert package_commands == PACKAGE_RUN_COMMANDS
+    assert package_commands[: len(PACKAGE_RUN_COMMANDS)] == PACKAGE_RUN_COMMANDS
     assert [command for command in all_commands if command.startswith("python -m pip install")] == [
         "python -m pip install uv==0.11.28",
         "python -m pip install uv==0.11.28",
@@ -301,7 +314,7 @@ def test_run_steps_contain_no_write_or_publication_commands() -> None:
     run_text = "\n".join(_all_run_commands()).lower()
     forbidden_patterns = [
         r"\bgit\s+(?:add|commit|push|tag|checkout|reset|clean)\b",
-        r"\b(?:publish|release|twine|upload|deploy)\b",
+        r"\b(?:publish|deploy)\b|\bgh\s+release\b|\btwine\s+upload\b",
         r"\b(?:curl|wget|invoke-webrequest)\b",
     ]
 
@@ -329,13 +342,112 @@ def test_windows_packaging_job_preserves_security_and_exact_contract() -> None:
         "cache-dependency-path": "pyproject.toml",
     }
     assert 'python-version: "3.13.9"' in _workflow_text()
-    assert _run_commands("package-windows") == PACKAGE_RUN_COMMANDS
+    assert _run_commands("package-windows")[: len(PACKAGE_RUN_COMMANDS)] == PACKAGE_RUN_COMMANDS
     packaging_test = next(
         step
         for step in steps
         if step.get("run") == PACKAGE_RUN_COMMANDS[-1]
     )
     assert packaging_test["env"] == {"ASSETGUARD_PACKAGING_INTEGRATION": "1"}
+
+
+def test_supply_chain_gate_is_mandatory_and_follows_validated_packaging() -> None:
+    steps = _steps("package-windows")
+    names = [step.get("name") for step in steps]
+    supply_chain = _step_named(SUPPLY_CHAIN_STEP_NAME)
+
+    assert names.index(SUPPLY_CHAIN_STEP_NAME) > names.index(
+        "Build and prove repeatable release"
+    )
+    assert names.index(SUPPLY_CHAIN_STEP_NAME) > names.index(
+        "Validate packaged artifacts"
+    )
+    assert supply_chain["shell"] == "pwsh"
+    assert supply_chain["env"] == {"ASSETGUARD_SOURCE_COMMIT": "${{ github.sha }}"}
+    assert "if" not in supply_chain
+    assert "continue-on-error" not in supply_chain
+
+
+def test_supply_chain_gate_generates_two_independent_locked_output_sets() -> None:
+    run = str(_step_named(SUPPLY_CHAIN_STEP_NAME)["run"])
+    generator_prefix = (
+        "uv run --locked --no-sync python tools/generate_supply_chain.py"
+    )
+    invocations = [
+        line.strip()
+        for line in run.splitlines()
+        if "tools/generate_supply_chain.py" in line
+    ]
+
+    assert len(invocations) == 2
+    assert all(line.startswith(generator_prefix) for line in invocations)
+    assert all("--release-dir $releaseDir" in line for line in invocations)
+    assert {re.search(r"--output-dir\s+(\$\w+)", line).group(1) for line in invocations} == {
+        "$firstOutput",
+        "$secondOutput",
+    }
+    assert all(
+        "--source-commit $env:ASSETGUARD_SOURCE_COMMIT" in line
+        for line in invocations
+    )
+    assert '$releaseDir = "dist/release"' in run
+    assert '$firstOutput = "build/supply-chain/ci-first"' in run
+    assert '$secondOutput = "build/supply-chain/ci-second"' in run
+    assert "$firstOutput" != "$secondOutput"
+
+
+def test_supply_chain_gate_validates_source_commit_and_exact_output_contract() -> None:
+    run = str(_step_named(SUPPLY_CHAIN_STEP_NAME)["run"])
+
+    assert "-cnotmatch '^[0-9a-f]{40}$'" in run
+    assert "exactly 40 lowercase hexadecimal characters" in run
+    assert {
+        name for name in SUPPLY_CHAIN_FILENAMES if f'"{name}"' in run
+    } == SUPPLY_CHAIN_FILENAMES
+    assert all(run.count(f'"{name}"') == 1 for name in SUPPLY_CHAIN_FILENAMES)
+    assert "Get-ChildItem -LiteralPath $directory -Force" in run
+    assert "Compare-Object -ReferenceObject $expectedNames" in run
+    assert "$actualNames.Count -ne $expectedNames.Count" in run
+    assert "Assert-ExactSupplyChainOutputSet $firstOutput" in run
+    assert "Assert-ExactSupplyChainOutputSet $secondOutput" in run
+    assert "verify_supply_chain_checksums" in run
+    assert "build/supply-chain/ci-first" in run
+    assert "build/supply-chain/ci-second" in run
+
+
+def test_supply_chain_gate_requires_filename_size_hash_and_byte_equality() -> None:
+    run = str(_step_named(SUPPLY_CHAIN_STEP_NAME)["run"])
+
+    assert "Compare-Object -ReferenceObject $firstNames" in run
+    assert "relative filename sets differ" in run
+    assert "(Get-Item -LiteralPath $firstPath).Length" in run
+    assert "(Get-Item -LiteralPath $secondPath).Length" in run
+    assert "Get-FileHash -LiteralPath $firstPath -Algorithm SHA256" in run
+    assert "Get-FileHash -LiteralPath $secondPath -Algorithm SHA256" in run
+    assert "[System.IO.File]::ReadAllBytes" in run
+    assert run.count("[Convert]::ToBase64String") == 2
+    assert all(
+        message in run
+        for message in (
+            "Supply-chain size mismatch for '$name'",
+            "Supply-chain SHA-256 mismatch for '$name'",
+            "Supply-chain byte mismatch for '$name'",
+        )
+    )
+
+
+def test_supply_chain_gate_fails_closed_without_upload_or_publication() -> None:
+    step = _step_named(SUPPLY_CHAIN_STEP_NAME)
+    run = str(step["run"])
+
+    assert run.count("if ($LASTEXITCODE -ne 0)") == 3
+    assert "throw" in run
+    assert "||" not in run
+    assert "continue-on-error" not in step
+    assert "uses" not in step
+    assert "build/supply-chain/" in run
+    assert "dist/release" in run
+    assert not re.search(r"\b(?:upload|publish|gh\s+release|git\s+add)\b", run, re.I)
 
 
 def test_packaging_job_has_no_upload_release_signing_or_secrets() -> None:

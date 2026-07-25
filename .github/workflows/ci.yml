@@ -114,3 +114,98 @@ jobs:
         env:
           ASSETGUARD_PACKAGING_INTEGRATION: "1"
         run: uv run --locked --no-sync python -m pytest -q tests/test_windows_packaging.py
+
+      - name: Generate and verify deterministic supply-chain metadata
+        shell: pwsh
+        env:
+          ASSETGUARD_SOURCE_COMMIT: ${{ github.sha }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          if ($env:ASSETGUARD_SOURCE_COMMIT -cnotmatch '^[0-9a-f]{40}$') {
+            throw "GitHub source commit must be exactly 40 lowercase hexadecimal characters."
+          }
+
+          $releaseDir = "dist/release"
+          $firstOutput = "build/supply-chain/ci-first"
+          $secondOutput = "build/supply-chain/ci-second"
+          $expectedNames = @(
+            "AssetGuard-0.1.0-all-extras.cdx.json"
+            "AssetGuard-0.1.0-runtime.cdx.json"
+            "AssetGuard-0.1.0-supply-chain.sha256"
+            "AssetGuard-0.1.0-windows-x86_64.provenance.json"
+          )
+
+          foreach ($outputDir in @($firstOutput, $secondOutput)) {
+            if (Test-Path -LiteralPath $outputDir) {
+              throw "Supply-chain output directory must be fresh: $outputDir"
+            }
+          }
+
+          uv run --locked --no-sync python tools/generate_supply_chain.py --release-dir $releaseDir --output-dir $firstOutput --source-commit $env:ASSETGUARD_SOURCE_COMMIT
+          if ($LASTEXITCODE -ne 0) {
+            throw "First supply-chain generation failed."
+          }
+          uv run --locked --no-sync python tools/generate_supply_chain.py --release-dir $releaseDir --output-dir $secondOutput --source-commit $env:ASSETGUARD_SOURCE_COMMIT
+          if ($LASTEXITCODE -ne 0) {
+            throw "Second supply-chain generation failed."
+          }
+
+          function Get-SupplyChainOutputNames([string] $directory) {
+            if (-not (Test-Path -LiteralPath $directory -PathType Container)) {
+              throw "Supply-chain output directory is missing: $directory"
+            }
+            return @(
+              Get-ChildItem -LiteralPath $directory -Force |
+                ForEach-Object { $_.Name } |
+                Sort-Object
+            )
+          }
+
+          function Assert-ExactSupplyChainOutputSet([string] $directory) {
+            $actualNames = @(Get-SupplyChainOutputNames $directory)
+            $differences = @(
+              Compare-Object -ReferenceObject $expectedNames -DifferenceObject $actualNames
+            )
+            if ($actualNames.Count -ne $expectedNames.Count -or $differences.Count -ne 0) {
+              throw "Supply-chain output set mismatch in '$directory': expected [$($expectedNames -join ', ')]; actual [$($actualNames -join ', ')]"
+            }
+          }
+
+          Assert-ExactSupplyChainOutputSet $firstOutput
+          Assert-ExactSupplyChainOutputSet $secondOutput
+
+          uv run --locked --no-sync python -c "from pathlib import Path; from tools.generate_supply_chain import verify_supply_chain_checksums; verify_supply_chain_checksums(Path(r'build/supply-chain/ci-first')); verify_supply_chain_checksums(Path(r'build/supply-chain/ci-second'))"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Supply-chain checksum validation failed."
+          }
+
+          $firstNames = @(Get-SupplyChainOutputNames $firstOutput)
+          $secondNames = @(Get-SupplyChainOutputNames $secondOutput)
+          $nameDifferences = @(
+            Compare-Object -ReferenceObject $firstNames -DifferenceObject $secondNames
+          )
+          if ($nameDifferences.Count -ne 0) {
+            throw "Supply-chain relative filename sets differ between independent generations."
+          }
+
+          foreach ($name in $firstNames) {
+            $firstPath = Join-Path $firstOutput $name
+            $secondPath = Join-Path $secondOutput $name
+            $firstSize = (Get-Item -LiteralPath $firstPath).Length
+            $secondSize = (Get-Item -LiteralPath $secondPath).Length
+            if ($firstSize -ne $secondSize) {
+              throw "Supply-chain size mismatch for '$name': $firstSize versus $secondSize bytes."
+            }
+
+            $firstHash = (Get-FileHash -LiteralPath $firstPath -Algorithm SHA256).Hash.ToLowerInvariant()
+            $secondHash = (Get-FileHash -LiteralPath $secondPath -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($firstHash -cne $secondHash) {
+              throw "Supply-chain SHA-256 mismatch for '$name': $firstHash versus $secondHash."
+            }
+
+            $firstBytes = [System.IO.File]::ReadAllBytes((Resolve-Path -LiteralPath $firstPath).Path)
+            $secondBytes = [System.IO.File]::ReadAllBytes((Resolve-Path -LiteralPath $secondPath).Path)
+            if ([Convert]::ToBase64String($firstBytes) -cne [Convert]::ToBase64String($secondBytes)) {
+              throw "Supply-chain byte mismatch for '$name'."
+            }
+          }
