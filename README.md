@@ -295,6 +295,8 @@ Phase 07 supports only OBJ meshes and does not validate referenced index ranges.
 
 The HTML report is static and has no interactive filtering, charts, PDF export, historical analytics, or live asset links. The cache has no pruning, migration, parallel-access guarantee, or repair command. AssetGuard has no GUI, asset repair or conversion, other mesh formats, full filesystem incremental skipping, Blender integration, or engine integration. The executable has no installer or code signature. Hosted results remain commit-specific, and local validation alone does not prove every supported runner and Python combination.
 
+AssetGuard fails closed on filesystem links at its trust boundaries. Scan roots and entries that are symbolic links, Windows junctions, or other reparse points are rejected rather than followed. JSON, HTML, and SQLite cache destinations are rejected when the destination or an existing ancestor is a link or reparse point, including cache sidecars. Invalid or non-UTF-8 rule files fail as concise operational errors. This policy can reject linked or cloud-redirection layouts; it reduces path-redirection risk but is not a claim of complete malware prevention or absolute security. Without native directory handles, a small local concurrent substitution window remains between the final validation and filesystem operation.
+
 ## Roadmap
 
 - Clean Windows-machine executable verification

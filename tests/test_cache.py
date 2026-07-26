@@ -2,14 +2,17 @@ import hashlib
 import json
 import os
 import sqlite3
+import stat
 from contextlib import closing
 from pathlib import Path
+from types import SimpleNamespace
 
 from PIL import Image
 import pytest
 from typer.testing import CliRunner, Result
 
 import assetguard.scanner as scanner_module
+import assetguard.cache as cache_module
 from assetguard.cache import (
     CACHE_SCHEMA_VERSION,
     OBJ_METRICS_VERSION,
@@ -20,6 +23,7 @@ from assetguard.cache import (
     CacheError,
     TextureMetrics,
     cache_related_paths,
+    validate_cache_path,
 )
 from assetguard.cli import app
 from assetguard.config import AssetGuardConfig, load_config
@@ -37,6 +41,53 @@ vt 1 0
 vt 0 1
 f 1/1 2/2 3/3
 """
+
+
+def test_cache_validation_rejects_reparse_sidecar_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = write_rules(tmp_path / "rules.yaml")
+    output = tmp_path / "report.json"
+    cache = tmp_path / "cache.sqlite3"
+    reparse_sidecar = Path(f"{cache}-wal").absolute()
+    reparse_sidecar.write_bytes(b"unchanged")
+    before = reparse_sidecar.read_bytes()
+    original_lstat = Path.lstat
+
+    def fake_lstat(path: Path) -> os.stat_result | SimpleNamespace:
+        metadata = original_lstat(path)
+        if path == reparse_sidecar:
+            return SimpleNamespace(
+                st_mode=stat.S_IFREG,
+                st_file_attributes=0x0400,
+            )
+        return metadata
+
+    monkeypatch.setattr(Path, "lstat", fake_lstat)
+
+    with pytest.raises(CacheError, match="reparse point"):
+        validate_cache_path(cache, config, output)
+    assert reparse_sidecar.read_bytes() == before
+
+
+def test_cache_open_revalidates_database_and_all_sidecars(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cache = tmp_path / "cache.sqlite3"
+    checked: list[str] = []
+    original = cache_module.validate_secure_path
+
+    def recording_validation(path: Path, *, description: str) -> Path:
+        checked.append(Path(path).name)
+        return original(path, description=description)
+
+    monkeypatch.setattr(cache_module, "validate_secure_path", recording_validation)
+
+    with AssetMetricsCache(cache):
+        pass
+
+    expected = {path.name for path in cache_related_paths(cache)}
+    assert expected <= set(checked)
 
 QUAD_OBJ = """\
 v 0 0 0

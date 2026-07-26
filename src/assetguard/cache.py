@@ -9,6 +9,11 @@ from pathlib import Path
 from typing import Any, Self
 
 from assetguard.obj_mesh import ObjMeshMetrics
+from assetguard.path_security import (
+    PathSecurityError,
+    prepare_secure_destination,
+    validate_secure_path,
+)
 
 CACHE_SCHEMA_VERSION = 1
 TEXTURE_METRICS_VERSION = 1
@@ -158,9 +163,13 @@ def validate_cache_path(cache_path: Path, config_path: Path, output_path: Path) 
     """Resolve and validate a cache path before any cache file is opened."""
 
     try:
-        resolved_cache = cache_path.resolve(strict=False)
-        resolved_config = config_path.resolve(strict=False)
-        resolved_output = output_path.resolve(strict=False)
+        resolved_cache = validate_secure_path(cache_path, description="cache")
+        resolved_config = validate_secure_path(config_path, description="configuration")
+        resolved_output = validate_secure_path(output_path, description="JSON report output")
+        for sidecar in cache_related_paths(resolved_cache)[1:]:
+            validate_secure_path(sidecar, description="cache sidecar")
+    except PathSecurityError as exc:
+        raise CacheError(str(exc)) from exc
     except OSError as exc:
         raise CacheError("cannot resolve cache, configuration, or report path") from exc
 
@@ -189,6 +198,12 @@ class AssetMetricsCache:
     """Transaction-scoped AssetGuard metric cache."""
 
     def __init__(self, path: Path) -> None:
+        try:
+            path = prepare_secure_destination(path, description="cache")
+            for sidecar in cache_related_paths(path)[1:]:
+                validate_secure_path(sidecar, description="cache sidecar")
+        except PathSecurityError as exc:
+            raise CacheError(str(exc)) from exc
         self.path = path
         self._connection: sqlite3.Connection | None = None
 
@@ -201,8 +216,11 @@ class AssetMetricsCache:
             raise CacheError("cache parent directory could not be created") from exc
 
         try:
+            validate_secure_path(path, description="cache")
+            for sidecar in cache_related_paths(path)[1:]:
+                validate_secure_path(sidecar, description="cache sidecar")
             connection = sqlite3.connect(str(path), timeout=1.0)
-        except sqlite3.Error as exc:
+        except (PathSecurityError, sqlite3.Error) as exc:
             raise CacheError("cache could not be opened") from exc
 
         self._connection = connection

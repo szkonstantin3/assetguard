@@ -18,7 +18,11 @@ from assetguard.html_reporting import (
     validate_html_output_path,
     write_html_report,
 )
-from assetguard.reporting import ReportWriteError, write_report
+from assetguard.reporting import (
+    ReportWriteError,
+    validate_report_output_path,
+    write_report,
+)
 from assetguard.scanner import ScanError, scan_directory, scan_directory_with_cache
 
 app = typer.Typer(
@@ -73,25 +77,26 @@ def scan(
     """Scan assets and write deterministic JSON and optional HTML reports."""
 
     try:
+        resolved_output = validate_report_output_path(output)
         rules = load_config(config)
         cache_hits: int | None = None
         cache_misses: int | None = None
         resolved_cache: Path | None = None
         cache_paths: tuple[Path, ...] = ()
         if cache is not None:
-            resolved_cache = validate_cache_path(cache, config, output)
+            resolved_cache = validate_cache_path(cache, config, resolved_output)
             cache_paths = cache_related_paths(resolved_cache)
 
         resolved_html: Path | None = None
         if html_output is not None:
             resolved_html = validate_html_output_path(
                 html_output,
-                output,
+                resolved_output,
                 config,
                 cache_paths,
             )
 
-        excluded_files = [output]
+        excluded_files = [resolved_output]
         if resolved_html is not None:
             excluded_files.append(resolved_html)
         excluded_files.extend(cache_paths)
@@ -119,7 +124,7 @@ def scan(
 
         if resolved_html is not None:
             render_html_report(report)
-        write_report(report, output)
+        write_report(report, resolved_output)
         if resolved_html is not None:
             write_html_report(report, resolved_html)
     except (
@@ -141,9 +146,9 @@ def scan(
     if cache_hits is not None and cache_misses is not None:
         typer.echo(f"Cache hits: {cache_hits}")
         typer.echo(f"Cache misses: {cache_misses}")
-    typer.echo(f"Report: {output}")
+    typer.echo(f"Report: {resolved_output}")
     if html_output is not None:
-        typer.echo(f"HTML report: {html_output}")
+        typer.echo(f"HTML report: {resolved_html}")
 
     if not report.summary.passed:
         raise typer.Exit(code=1)

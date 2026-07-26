@@ -4,7 +4,9 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner, Result
 
+import assetguard.reporting as reporting_module
 from assetguard.cli import app
+from assetguard.path_security import PathSecurityError
 
 runner = CliRunner()
 
@@ -185,6 +187,79 @@ def test_invalid_directory_and_configuration_return_exit_code_two(tmp_path: Path
     assert bad_config_result.exit_code == 2
     assert "Error:" in bad_config_result.stderr
     assert "Traceback" not in missing_result.stderr + bad_config_result.stderr
+
+
+def test_invalid_utf8_configuration_returns_two_without_outputs_or_traceback(
+    tmp_path: Path,
+) -> None:
+    assets = tmp_path / "assets"
+    assets.mkdir()
+    asset = assets / "T_valid.bin"
+    asset.write_bytes(b"unchanged")
+    config = tmp_path / "rules.yaml"
+    config.write_bytes(b"version: \xff\xfe\n")
+    output = tmp_path / "report.json"
+    html_output = tmp_path / "report.html"
+    cache = tmp_path / "cache.sqlite3"
+    asset_before = asset.read_bytes()
+    config_before = config.read_bytes()
+
+    result = runner.invoke(
+        app,
+        [
+            "scan",
+            str(assets),
+            "--config",
+            str(config),
+            "--output",
+            str(output),
+            "--html-output",
+            str(html_output),
+            "--cache",
+            str(cache),
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert result.stderr.startswith("Error:")
+    assert "not valid UTF-8" in result.stderr
+    assert "Traceback" not in result.stderr
+    assert not output.exists()
+    assert not html_output.exists()
+    assert not cache.exists()
+    assert not any(tmp_path.glob("*.sqlite3-*"))
+    assert not any(tmp_path.rglob("*.tmp"))
+    assert asset.read_bytes() == asset_before
+    assert config.read_bytes() == config_before
+
+
+def test_json_writer_revalidation_detects_substitution_before_temporary_creation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assets = tmp_path / "assets"
+    assets.mkdir()
+    (assets / "T_valid.bin").write_bytes(b"valid")
+    config = write_rules(tmp_path / "rules.yaml")
+    output = tmp_path / "nested" / "report.json"
+    original = reporting_module.validate_secure_path
+    validation_calls = 0
+
+    def substituted_path(path: Path, *, description: str) -> Path:
+        nonlocal validation_calls
+        validation_calls += 1
+        if validation_calls == 4:
+            raise PathSecurityError("JSON report output path contains a reparse point")
+        return original(path, description=description)
+
+    monkeypatch.setattr(reporting_module, "validate_secure_path", substituted_path)
+
+    result = invoke_scan(assets, config, output)
+
+    assert result.exit_code == 2
+    assert "reparse point" in result.stderr
+    assert "Traceback" not in result.stderr
+    assert not output.exists()
+    assert list(output.parent.glob(".report.json.*.tmp")) == []
 
 
 def test_identical_scans_write_byte_identical_reports_and_exclude_output(tmp_path: Path) -> None:

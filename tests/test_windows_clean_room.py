@@ -26,7 +26,7 @@ POWERSHELL_VERIFIER = (
     / "clean_room"
     / "verify_release.ps1"
 )
-SOURCE_HASHES = {
+PHASE07_SOURCE_HASHES = {
     "__init__.py": "6aedc32f97378e0f1e7736ae04ae511d0aaf2e033b2e2e4ff52114700bb87964",
     "__main__.py": "987f943932d8a1430f6760f7c3459de9ff7817abb9b939a97c491e421e717c53",
     "cache.py": "0538b115599e2102e94477b407f0253493da6f453021bd30412847d2285580a8",
@@ -38,6 +38,23 @@ SOURCE_HASHES = {
     "parallel.py": "ca192009c57b66ae5ef856aecef971f7b420f6f36e2b5ecc1c6259efdb0f3937",
     "reporting.py": "d7375fbefa1ce10b89fb27f72abf3456851cdd87fb64c9a06c9e6167bb11156e",
     "scanner.py": "0f578c7f9814ed9bd82ec543f5aef417753c8c1c95fa3ec204dc1d8ee1b12f4e",
+}
+PHASE07_SOURCE_MANIFEST_SHA256 = (
+    "98b05b4de3ff913c4f2ee51bfaacf2099c4e6ab8ab5fb35b64a67d33404f66e0"
+)
+PHASE12C_R1_SOURCE_HASHES = {
+    "__init__.py": "6aedc32f97378e0f1e7736ae04ae511d0aaf2e033b2e2e4ff52114700bb87964",
+    "__main__.py": "987f943932d8a1430f6760f7c3459de9ff7817abb9b939a97c491e421e717c53",
+    "cache.py": "a1af3167b1d1d7a4b323fcf0483610afaf297c89a475a49f69197fcc28c028b3",
+    "cli.py": "d04ab38023836fbfcfe8b806bf5b6ae5efde958143c917ecb1b0428aad8e8772",
+    "config.py": "8a38f07e0204a6bcea4cf1cdceb5fa71be6ebf0fd8774380f605a6b725f9f112",
+    "html_reporting.py": "2f38c476581af9a2002bd42345b0b0626e0ad1d278277ccae6953f651028e2db",
+    "models.py": "21ea12cd4bd7ae382643a943100db46059ec1b4664742a2f461bd0dc231e6d45",
+    "obj_mesh.py": "ede483473a709708284897db9d8338da5f26cfa93ec1f4ee03c856d3f090bdf4",
+    "parallel.py": "ca192009c57b66ae5ef856aecef971f7b420f6f36e2b5ecc1c6259efdb0f3937",
+    "path_security.py": "b50b5a4d156336463e0c694a01ad05baeae15a45dd6aa3acefebd141ba165af6",
+    "reporting.py": "f39faddfe933864d064dde955381375a9dd7a7c19b7d45cb7498278ec979fba4",
+    "scanner.py": "93a329b0133b1840fc617d741f2e4cad117ad19c735c73b903ae2af056a9c83f",
 }
 RELEASE_ARTIFACTS = verifier.release_artifacts(PROJECT_ROOT, verifier.EXPECTED_VERSION)
 RELEASE_ARTIFACTS_AVAILABLE = all(
@@ -161,13 +178,31 @@ def test_verifier_files_exist_and_are_portable_text() -> None:
         assert b"\t" not in data
 
 
-def test_application_source_hashes_remain_phase07_exact() -> None:
+def test_phase07_source_hash_manifest_remains_exact() -> None:
+    assert all(
+        re.fullmatch(r"[0-9a-f]{64}", digest)
+        for digest in PHASE07_SOURCE_HASHES.values()
+    )
+    canonical_manifest = "".join(
+        f"{filename}\0{digest}\n"
+        for filename, digest in sorted(PHASE07_SOURCE_HASHES.items())
+    ).encode("ascii")
+
+    assert hashlib.sha256(canonical_manifest).hexdigest() == PHASE07_SOURCE_MANIFEST_SHA256
+
+
+def test_application_source_hashes_match_phase12c_r1_exact() -> None:
     source_root = PROJECT_ROOT / "src" / "assetguard"
+    source_paths = sorted(source_root.glob("*.py"), key=lambda path: path.name)
     actual = {
         path.name: hashlib.sha256(path.read_bytes()).hexdigest()
-        for path in source_root.glob("*.py")
+        for path in source_paths
     }
-    assert actual == SOURCE_HASHES
+    assert all(
+        re.fullmatch(r"[0-9a-f]{64}", digest)
+        for digest in PHASE12C_R1_SOURCE_HASHES.values()
+    )
+    assert actual == PHASE12C_R1_SOURCE_HASHES
 
 
 @pytest.mark.skipif(

@@ -8,6 +8,11 @@ from pathlib import Path
 from typing import Iterable
 
 from assetguard.models import Issue, Report
+from assetguard.path_security import (
+    PathSecurityError,
+    prepare_secure_destination,
+    validate_secure_path,
+)
 
 
 class HtmlReportError(Exception):
@@ -182,9 +187,12 @@ def write_html_report(report: Report, destination: Path) -> None:
 
     temporary_path: Path | None = None
     try:
-        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination = prepare_secure_destination(
+            destination, description="HTML report output"
+        )
         rendered = render_html_report(report)
         normalized = rendered.replace("\r\n", "\n").replace("\r", "\n").rstrip("\n") + "\n"
+        validate_secure_path(destination, description="HTML report output")
         with tempfile.NamedTemporaryFile(
             mode="w",
             encoding="utf-8",
@@ -198,14 +206,19 @@ def write_html_report(report: Report, destination: Path) -> None:
             temporary_file.write(normalized)
             temporary_file.flush()
             os.fsync(temporary_file.fileno())
+        validate_secure_path(temporary_path, description="HTML report temporary file")
+        validate_secure_path(destination, description="HTML report output")
         os.replace(temporary_path, destination)
     except HtmlReportError:
         raise
-    except (OSError, TypeError, ValueError, UnicodeError) as exc:
+    except (OSError, PathSecurityError, TypeError, ValueError, UnicodeError) as exc:
         if temporary_path is not None:
             try:
+                validate_secure_path(
+                    temporary_path, description="HTML report temporary file"
+                )
                 temporary_path.unlink(missing_ok=True)
-            except OSError:
+            except (OSError, PathSecurityError):
                 pass
         raise HtmlReportError(f"cannot write HTML report '{destination}': {exc}") from exc
 
@@ -219,10 +232,20 @@ def validate_html_output_path(
     """Resolve and validate an HTML output path before scanning."""
 
     try:
-        resolved_html = html_output.resolve(strict=False)
-        resolved_json = json_output.resolve(strict=False)
-        resolved_config = config_path.resolve(strict=False)
-        resolved_cache_paths = tuple(path.resolve(strict=False) for path in cache_paths)
+        resolved_html = validate_secure_path(
+            html_output, description="HTML report output"
+        )
+        resolved_json = validate_secure_path(
+            json_output, description="JSON report output"
+        )
+        resolved_config = validate_secure_path(
+            config_path, description="configuration"
+        )
+        resolved_cache_paths = tuple(
+            validate_secure_path(path, description="cache") for path in cache_paths
+        )
+    except PathSecurityError as exc:
+        raise HtmlReportError(str(exc)) from exc
     except OSError as exc:
         raise HtmlReportError("cannot resolve HTML output or related paths") from exc
 

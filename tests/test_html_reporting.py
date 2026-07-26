@@ -23,6 +23,7 @@ from assetguard.html_reporting import (
     write_html_report,
 )
 from assetguard.models import Issue, Report, ScanInfo, Summary, ToolInfo
+from assetguard.path_security import PathSecurityError
 
 runner = CliRunner()
 
@@ -338,16 +339,14 @@ def test_path_resolution_failure_is_typed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    original_resolve = Path.resolve
-
-    def fail_html_resolve(path: Path, strict: bool = False) -> Path:
+    def fail_html_validation(path: Path, *, description: str) -> Path:
         if path.name == "report.html":
-            raise OSError("resolution failed")
-        return original_resolve(path, strict=strict)
+            raise PathSecurityError("HTML report output path could not be inspected")
+        return path.absolute()
 
-    monkeypatch.setattr(Path, "resolve", fail_html_resolve)
+    monkeypatch.setattr(html_module, "validate_secure_path", fail_html_validation)
 
-    with pytest.raises(HtmlReportError, match="cannot resolve HTML output"):
+    with pytest.raises(HtmlReportError, match="could not be inspected"):
         validate_html_output_path(
             tmp_path / "report.html",
             tmp_path / "report.json",

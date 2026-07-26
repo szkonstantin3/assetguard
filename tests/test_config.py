@@ -103,3 +103,15 @@ def test_unknown_top_level_field_is_rejected(tmp_path: Path) -> None:
 
     with pytest.raises(ConfigurationError, match="unexpected"):
         load_config(path)
+
+
+def test_invalid_utf8_configuration_is_a_typed_concise_error(tmp_path: Path) -> None:
+    path = tmp_path / "rules.yaml"
+    path.write_bytes(b"version: \xff\xfe\n")
+    before = path.read_bytes()
+
+    with pytest.raises(ConfigurationError, match="not valid UTF-8") as raised:
+        load_config(path)
+
+    assert "codec" not in str(raised.value)
+    assert path.read_bytes() == before

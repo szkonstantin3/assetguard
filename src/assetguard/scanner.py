@@ -21,6 +21,12 @@ from assetguard.config import AssetGuardConfig
 from assetguard.models import Issue, Report, ScanInfo, Summary, ToolInfo
 from assetguard.obj_mesh import ObjMeshMetrics, ObjParseError, parse_obj
 from assetguard.parallel import MAX_WORKERS, MIN_WORKERS, ordered_bounded_map
+from assetguard.path_security import (
+    PathSecurityError,
+    lexical_absolute_path,
+    validate_existing_entry,
+    validate_secure_path,
+)
 
 HASH_CHUNK_SIZE = 1024 * 1024
 
@@ -54,9 +60,16 @@ class _ParseWork:
 
 def _resolved_path(path: Path) -> Path:
     try:
-        return path.resolve(strict=False)
-    except OSError as exc:
+        return validate_secure_path(path, description="scan path")
+    except (OSError, PathSecurityError) as exc:
         raise ScanError(f"cannot resolve path '{path}': {exc}") from exc
+
+
+def _safe_scan_entry(path: Path, *, description: str) -> os.stat_result:
+    try:
+        return validate_existing_entry(path, description=description)
+    except PathSecurityError as exc:
+        raise ScanError(str(exc)) from exc
 
 
 def _collect_files(
@@ -72,19 +85,26 @@ def _collect_files(
     for current_root, directory_names, file_names in os.walk(
         root, topdown=True, onerror=raise_walk_error, followlinks=False
     ):
-        directory_names[:] = sorted(
-            name for name in directory_names if name not in excluded_directories
-        )
+        current_path = Path(current_root)
+        _safe_scan_entry(current_path, description="scanned directory")
+        safe_directories: list[str] = []
+        for directory_name in sorted(directory_names):
+            directory_path = current_path / directory_name
+            metadata = _safe_scan_entry(
+                directory_path, description="scanned directory entry"
+            )
+            if not stat.S_ISDIR(metadata.st_mode):
+                raise ScanError(f"scanned directory entry is not a directory: '{directory_path}'")
+            if directory_name not in excluded_directories:
+                safe_directories.append(directory_name)
+        directory_names[:] = safe_directories
         for file_name in sorted(file_names):
             file_path = Path(current_root) / file_name
             resolved_file = _resolved_path(file_path)
             if resolved_file in excluded_files:
                 continue
-            try:
-                mode = file_path.stat().st_mode
-            except OSError as exc:
-                raise ScanError(f"cannot inspect file '{file_path}': {exc}") from exc
-            if not stat.S_ISREG(mode):
+            metadata = _safe_scan_entry(file_path, description="scanned file entry")
+            if not stat.S_ISREG(metadata.st_mode):
                 continue
             relative_path = file_path.relative_to(root).as_posix()
             collected.append((relative_path, file_path))
@@ -95,6 +115,14 @@ def _collect_files(
 
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
+    try:
+        _safe_scan_entry(path, description="scanned file entry")
+    except ScanError as exc:
+        try:
+            path.lstat()
+        except OSError:
+            raise ScanError("file could not be read") from exc
+        raise
     try:
         with path.open("rb") as source:
             while chunk := source.read(HASH_CHUNK_SIZE):
@@ -121,6 +149,7 @@ def _is_power_of_two(value: int) -> bool:
 
 def _read_texture_metrics(relative_path: str, path: Path) -> TextureMetrics:
     try:
+        _safe_scan_entry(path, description="scanned texture entry")
         with Image.open(path) as image:
             width, height = image.size
             image.verify()
@@ -182,6 +211,7 @@ def _texture_issues(
 
 def _read_mesh_metrics(relative_path: str, path: Path) -> ObjMeshMetrics:
     try:
+        _safe_scan_entry(path, description="scanned mesh entry")
         return parse_obj(path)
     except ObjParseError as exc:
         raise ScanError(f"cannot parse mesh '{relative_path}': {exc}") from exc
@@ -291,12 +321,19 @@ def _scan_directory(
 
     if not MIN_WORKERS <= workers <= MAX_WORKERS:
         raise ScanError(f"workers must be between {MIN_WORKERS} and {MAX_WORKERS}")
-    if not root.exists():
+    lexical_root = lexical_absolute_path(root)
+    if not os.path.lexists(lexical_root):
         raise ScanError(f"input directory does not exist: '{root}'")
-    if not root.is_dir():
+    try:
+        root_metadata = validate_existing_entry(
+            lexical_root, description="scanned root"
+        )
+    except PathSecurityError as exc:
+        raise ScanError(str(exc)) from exc
+    if not stat.S_ISDIR(root_metadata.st_mode):
         raise ScanError(f"input path is not a directory: '{root}'")
 
-    resolved_root = _resolved_path(root)
+    resolved_root = _resolved_path(lexical_root)
     resolved_exclusions = {_resolved_path(path) for path in excluded_files}
     collected_files = _collect_files(
         resolved_root,

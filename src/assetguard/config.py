@@ -125,6 +125,8 @@ def load_config(path: Path) -> AssetGuardConfig:
 
     try:
         raw_text = path.read_text(encoding="utf-8")
+    except UnicodeError as exc:
+        raise ConfigurationError(f"configuration '{path}' is not valid UTF-8") from exc
     except OSError as exc:
         raise ConfigurationError(f"cannot read configuration '{path}': {exc}") from exc
 

@@ -383,7 +383,7 @@ def test_reproducibility_mismatch_does_not_publish(
     def fake_executable(_root: Path, current: Path, _version: str) -> Path:
         return _synthetic_pe(current / "AssetGuard.exe")
 
-    proof = build.PackagedProof(0, 0, 1, 2, 2, True, True, True)
+    proof = build.PackagedProof(0, 0, 1, 2, 2, True, True, True, True)
     monkeypatch.setattr(build, "invoke_pyinstaller", fake_executable)
     monkeypatch.setattr(build, "run_packaged_proofs", lambda *_args: proof)
     monkeypatch.setattr(
@@ -501,6 +501,7 @@ def test_built_executable_help_and_full_packaged_proof(tmp_path: Path) -> None:
     )
     assert proof.cache_hits == 2
     assert proof.json_equal and proof.html_equal and proof.assets_unchanged
+    assert proof.security_hardening
 
 
 @pytest.mark.skipif(not INTEGRATION_ENABLED, reason="packaging integration not enabled")

@@ -11,6 +11,7 @@ import json
 import os
 import platform
 import shutil
+import stat
 import struct
 import subprocess
 import sys
@@ -63,6 +64,7 @@ class PackagedProof:
     json_equal: bool
     html_equal: bool
     assets_unchanged: bool
+    security_hardening: bool
 
 
 def sha256_bytes(data: bytes) -> str:
@@ -503,14 +505,14 @@ def _scan_command(
         "--config",
         str(config.resolve()),
         "--output",
-        str(output.resolve()),
+        str(Path(os.path.abspath(output))),
         "--workers",
         str(workers),
     ]
     if html_output is not None:
-        command.extend(["--html-output", str(html_output.resolve())])
+        command.extend(["--html-output", str(Path(os.path.abspath(html_output)))])
     if cache is not None:
-        command.extend(["--cache", str(cache.resolve())])
+        command.extend(["--cache", str(Path(os.path.abspath(cache)))])
     return command
 
 
@@ -519,6 +521,128 @@ def _asset_state(paths: Sequence[Path]) -> dict[str, tuple[str, int, int]]:
         path.name: (sha256_file(path), path.stat().st_size, path.stat().st_mtime_ns)
         for path in paths
     }
+
+
+def _create_windows_junction(link: Path, target: Path) -> None:
+    """Create and verify one real Windows directory junction for packaged proofs."""
+
+    if os.name != "nt":
+        raise BuildError("packaged junction proof requires Windows")
+    command_processor = os.environ.get("COMSPEC", r"C:\Windows\System32\cmd.exe")
+    result = subprocess.run(
+        [command_processor, "/d", "/c", "mklink", "/J", str(link), str(target)],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+    if result.returncode != 0:
+        raise BuildError(f"cannot create packaged-proof junction: {result.stderr.strip()}")
+    metadata = link.lstat()
+    reparse_attribute = int(getattr(metadata, "st_file_attributes", 0)) & 0x0400
+    if not link.is_junction() or not reparse_attribute or stat.S_ISLNK(metadata.st_mode):
+        raise BuildError("packaged-proof junction was not identified as a Windows junction")
+
+
+def _run_packaged_security_proofs(
+    executable: Path,
+    proof_root: Path,
+    environment: Mapping[str, str],
+) -> bool:
+    """Require junction-safe outputs and concise invalid-UTF-8 failure."""
+
+    security_root = proof_root / "security-boundaries"
+    assets = security_root / "assets"
+    outside = security_root / "outside"
+    junction = assets / "redirect"
+    assets.mkdir(parents=True)
+    outside.mkdir()
+    asset = assets / "T_asset.bin"
+    asset.write_bytes(b"security-proof-input")
+    valid_config = _naming_rules(security_root / "rules.yaml", duplicates=False)
+    invalid_config = security_root / "invalid-utf8.yaml"
+    invalid_config.write_bytes(b"version: \xff\xfe\n")
+    inputs = [asset, valid_config, invalid_config]
+    before = _asset_state(inputs)
+    _create_windows_junction(junction, outside)
+    cases = [
+        (
+            "JSON junction",
+            _scan_command(
+                executable,
+                assets,
+                valid_config,
+                junction / "report.json",
+            ),
+        ),
+        (
+            "HTML junction",
+            _scan_command(
+                executable,
+                assets,
+                valid_config,
+                security_root / "html-safe.json",
+                html_output=junction / "report.html",
+            ),
+        ),
+        (
+            "cache junction",
+            _scan_command(
+                executable,
+                assets,
+                valid_config,
+                security_root / "cache-safe.json",
+                cache=junction / "cache.sqlite3",
+            ),
+        ),
+        (
+            "invalid UTF-8 configuration",
+            _scan_command(
+                executable,
+                assets,
+                invalid_config,
+                security_root / "invalid-utf8.json",
+            ),
+        ),
+    ]
+    try:
+        for name, command in cases:
+            result = _run_command(
+                command,
+                cwd=security_root,
+                environment=environment,
+                expected_exit=2,
+            )
+            if not result.stderr.startswith("Error:") or "Traceback" in result.stderr:
+                raise BuildError(f"packaged {name} failure was not concise")
+            if list(outside.iterdir()):
+                raise BuildError(f"packaged {name} wrote through a junction")
+    finally:
+        if junction.is_junction():
+            junction.rmdir()
+
+    forbidden_names = {
+        "report.json",
+        "report.html",
+        "cache.sqlite3",
+        "cache.sqlite3-journal",
+        "cache.sqlite3-wal",
+        "cache.sqlite3-shm",
+        "html-safe.json",
+        "cache-safe.json",
+        "invalid-utf8.json",
+    }
+    created = {
+        path.name
+        for path in security_root.rglob("*")
+        if path.is_file() and path not in inputs
+    }
+    if created & forbidden_names or any(path.name.endswith(".tmp") for path in security_root.rglob("*")):
+        raise BuildError("packaged security failure created an output or temporary file")
+    if _asset_state(inputs) != before:
+        raise BuildError("packaged security proof modified an input")
+    return True
 
 
 def run_packaged_proofs(executable: Path, build_root: Path) -> PackagedProof:
@@ -671,6 +795,10 @@ f 1/1 2/2 3/3
     if "Traceback" in malformed_result.stderr or malformed_output.exists():
         raise BuildError("packaged operational failure exposed a traceback or report")
 
+    security_hardening = _run_packaged_security_proofs(
+        executable, proof_root, executable_environment
+    )
+
     after = _asset_state(asset_paths)
     assets_unchanged = before == after
     if not assets_unchanged:
@@ -684,6 +812,7 @@ f 1/1 2/2 3/3
         json_equal=json_equal,
         html_equal=html_equal,
         assets_unchanged=assets_unchanged,
+        security_hardening=security_hardening,
     )
 
 
@@ -1056,6 +1185,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         f"exits {last_proof.valid_exit}/{last_proof.warning_exit}/"
         f"{last_proof.error_exit}/{last_proof.operational_exit}, "
         f"cache hits {last_proof.cache_hits}, JSON/HTML equal"
+        f", security hardening {'passed' if last_proof.security_hardening else 'failed'}"
     )
     print(f"Published release: {artifacts.executable.parent}")
     for path in artifacts.ordered_paths():
