@@ -66,6 +66,14 @@ uv run --locked --no-sync python tools/build_windows_release.py --verify-reprodu
 
 After an accepted dependency change, regenerate the runtime and all-extras SBOMs and provenance, then compare and review their exact component, relationship, toolchain, source-digest, and checksum changes.
 
+## Dependabot review boundaries
+
+Dependabot checks the `uv` dependency graph each Monday and GitHub Actions each Tuesday. Each dependency and Action update remains independently reviewable; updates are not grouped. The seven-day default cooldown does not delay security updates.
+
+Dependabot does not maintain AssetGuard's explicit `uv==0.11.28` toolchain pins. Changing the required uv version, CI installer version, or related toolchain contract requires a separate validated phase.
+
+Every remote GitHub Actions reference remains pinned to a lowercase 40-character commit SHA with a same-line version comment. A Dependabot proposal must preserve that immutable-reference contract and pass the complete hosted validation before acceptance.
+
 ## Publication policy
 
 A lock update uses a dedicated commit with no mixed feature work. It must not be force-pushed, and hosted CI must pass for the exact commit. Accepting or committing a lock update does not authorize a release or artifact publication. Signing and publication each require separate explicit authorization.
