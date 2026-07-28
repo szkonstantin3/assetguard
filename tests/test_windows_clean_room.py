@@ -56,6 +56,24 @@ PHASE12C_R1_SOURCE_HASHES = {
     "reporting.py": "f39faddfe933864d064dde955381375a9dd7a7c19b7d45cb7498278ec979fba4",
     "scanner.py": "93a329b0133b1840fc617d741f2e4cad117ad19c735c73b903ae2af056a9c83f",
 }
+PHASE12C_R1_SOURCE_MANIFEST_SHA256 = (
+    "fc8356e40606c4920f5156769e5dc641c5622760caea02cbea5829595422c8d6"
+)
+PHASE12C_R3C_SOURCE_HASHES = {
+    "__init__.py": "6aedc32f97378e0f1e7736ae04ae511d0aaf2e033b2e2e4ff52114700bb87964",
+    "__main__.py": "987f943932d8a1430f6760f7c3459de9ff7817abb9b939a97c491e421e717c53",
+    "cache.py": "ea0f176796750cf9ffaf0112ce509870a107d55a1116d61262caa0c5a59e9c78",
+    "cli.py": "36c5eb695de7540c8ea0b0f069c880a03f81c9292fd5b06c566d6b7bd19d94eb",
+    "config.py": "30a033ccad5d2c609b47eec09240cabd9bc443223fbf7d8a18c53973bec5c242",
+    "html_reporting.py": "2b3ea18a8475a29b54d6bd1f4bf882b03a0d1a512f145997e4d8bf16b2f372c0",
+    "models.py": "21ea12cd4bd7ae382643a943100db46059ec1b4664742a2f461bd0dc231e6d45",
+    "obj_mesh.py": "88466ff8faa19e973cc9ea8d2d638b7ff9a41acfcbd7b81960850fd0479c19b3",
+    "parallel.py": "d9eb7007d6ec5f040beb3d362ba0d3f3750a36821b11281b07859250cf18ee22",
+    "path_security.py": "b50b5a4d156336463e0c694a01ad05baeae15a45dd6aa3acefebd141ba165af6",
+    "reporting.py": "ea36faa7392e74e276a489b21808e31fbffb4d8626be2edcb0e5873ba5cc631b",
+    "resource_limits.py": "358c52e0ed404252afdb741afa7c7d519572292f8372b82ab72bd751b67f37dc",
+    "scanner.py": "0cdef077c680e02698e1b29a693907af662a7f842f026dd1661c02d87140d114",
+}
 RELEASE_ARTIFACTS = verifier.release_artifacts(PROJECT_ROOT, verifier.EXPECTED_VERSION)
 RELEASE_ARTIFACTS_AVAILABLE = all(
     path.is_file() for path in RELEASE_ARTIFACTS.ordered_paths()
@@ -191,7 +209,23 @@ def test_phase07_source_hash_manifest_remains_exact() -> None:
     assert hashlib.sha256(canonical_manifest).hexdigest() == PHASE07_SOURCE_MANIFEST_SHA256
 
 
-def test_application_source_hashes_match_phase12c_r1_exact() -> None:
+def test_phase12c_r1_source_hash_manifest_remains_exact() -> None:
+    assert all(
+        re.fullmatch(r"[0-9a-f]{64}", digest)
+        for digest in PHASE12C_R1_SOURCE_HASHES.values()
+    )
+    canonical_manifest = "".join(
+        f"{filename}\0{digest}\n"
+        for filename, digest in sorted(PHASE12C_R1_SOURCE_HASHES.items())
+    ).encode("ascii")
+
+    assert (
+        hashlib.sha256(canonical_manifest).hexdigest()
+        == PHASE12C_R1_SOURCE_MANIFEST_SHA256
+    )
+
+
+def test_application_source_hashes_match_phase12c_r3c_exact() -> None:
     source_root = PROJECT_ROOT / "src" / "assetguard"
     source_paths = sorted(source_root.glob("*.py"), key=lambda path: path.name)
     actual = {
@@ -200,9 +234,9 @@ def test_application_source_hashes_match_phase12c_r1_exact() -> None:
     }
     assert all(
         re.fullmatch(r"[0-9a-f]{64}", digest)
-        for digest in PHASE12C_R1_SOURCE_HASHES.values()
+        for digest in PHASE12C_R3C_SOURCE_HASHES.values()
     )
-    assert actual == PHASE12C_R1_SOURCE_HASHES
+    assert actual == PHASE12C_R3C_SOURCE_HASHES
 
 
 @pytest.mark.skipif(

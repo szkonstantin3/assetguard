@@ -304,6 +304,7 @@ def test_source_digest_input_set_contains_all_required_classes() -> None:
     assert "tools/build_windows_release.py" in relative
     assert relative.count("uv.lock") == 1
     assert "src/assetguard/cli.py" in relative
+    assert "src/assetguard/resource_limits.py" in relative
     assert all(not Path(path).is_absolute() for path in relative)
 
 

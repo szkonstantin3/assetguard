@@ -5,6 +5,22 @@ from typing import Literal
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
+from yaml.events import (
+    AliasEvent,
+    MappingEndEvent,
+    MappingStartEvent,
+    ScalarEvent,
+    SequenceEndEvent,
+    SequenceStartEvent,
+)
+
+from assetguard.path_security import PathSecurityError, validate_secure_path
+from assetguard.resource_limits import (
+    PRODUCTION_LIMITS,
+    ResourceBudget,
+    ResourceLimits,
+    active_resource_budget,
+)
 
 Severity = Literal["error", "warning"]
 
@@ -120,20 +136,91 @@ class AssetGuardConfig(StrictConfigModel):
     duplicates: DuplicateConfig
 
 
-def load_config(path: Path) -> AssetGuardConfig:
+def _validate_yaml_structure(raw_text: str, budget: ResourceBudget) -> None:
+    """Count composed YAML nodes and depth from parser events before construction."""
+
+    node_count = 0
+    container_depth = 0
+    try:
+        for event in yaml.parse(raw_text, Loader=yaml.SafeLoader):
+            budget.check_deadline()
+            if isinstance(event, (MappingStartEvent, SequenceStartEvent)):
+                node_count += 1
+                container_depth += 1
+                budget.check_value(
+                    "YAML composed nodes",
+                    node_count,
+                    budget.limits.yaml_nodes,
+                    "nodes",
+                )
+                budget.check_value(
+                    "YAML nesting depth",
+                    container_depth,
+                    budget.limits.yaml_depth,
+                    "levels",
+                )
+            elif isinstance(event, ScalarEvent):
+                node_count += 1
+                budget.check_value(
+                    "YAML composed nodes",
+                    node_count,
+                    budget.limits.yaml_nodes,
+                    "nodes",
+                )
+                budget.check_value(
+                    "YAML nesting depth",
+                    container_depth + 1,
+                    budget.limits.yaml_depth,
+                    "levels",
+                )
+            elif isinstance(event, (MappingEndEvent, SequenceEndEvent)):
+                container_depth -= 1
+            elif isinstance(event, AliasEvent):
+                # PyYAML composition reuses the anchored node; aliases do not
+                # create another composed node and retain their prior semantics.
+                continue
+    except yaml.YAMLError as exc:
+        raise ConfigurationError(f"invalid YAML in configuration: {exc}") from exc
+
+
+def load_config(
+    path: Path,
+    *,
+    _budget: ResourceBudget | None = None,
+    _limits: ResourceLimits = PRODUCTION_LIMITS,
+) -> AssetGuardConfig:
     """Read and validate an AssetGuard YAML configuration file."""
 
+    budget = _budget or active_resource_budget(_limits)
+    budget.check_deadline()
     try:
-        raw_text = path.read_text(encoding="utf-8")
-    except UnicodeError as exc:
-        raise ConfigurationError(f"configuration '{path}' is not valid UTF-8") from exc
+        secure_path = validate_secure_path(path, description="configuration")
+        with secure_path.open("rb") as source:
+            raw_bytes = source.read(budget.limits.rules_bytes + 1)
+        budget.check_deadline()
+    except PathSecurityError as exc:
+        raise ConfigurationError(str(exc)) from exc
     except OSError as exc:
         raise ConfigurationError(f"cannot read configuration '{path}': {exc}") from exc
 
+    budget.check_value(
+        "rules YAML raw bytes",
+        len(raw_bytes),
+        budget.limits.rules_bytes,
+        "bytes",
+    )
+    try:
+        raw_text = raw_bytes.decode("utf-8")
+    except UnicodeError as exc:
+        raise ConfigurationError(f"configuration '{path}' is not valid UTF-8") from exc
+
+    _validate_yaml_structure(raw_text, budget)
+    budget.check_deadline()
     try:
         data = yaml.safe_load(raw_text)
     except yaml.YAMLError as exc:
         raise ConfigurationError(f"invalid YAML in configuration '{path}': {exc}") from exc
+    budget.check_deadline()
 
     if not isinstance(data, dict):
         raise ConfigurationError(f"configuration '{path}' must contain a YAML mapping")

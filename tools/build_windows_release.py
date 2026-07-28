@@ -33,6 +33,10 @@ PRODUCT_NAME = "AssetGuard"
 ARTIFACT_PLATFORM = "windows"
 ARTIFACT_ARCHITECTURE = "x86_64"
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+RESOURCE_RULES_BYTES = 1_048_576
+RESOURCE_DIRECTORY_DEPTH = 64
+RESOURCE_OBJ_LINE_BYTES = 1_048_576
+RESOURCE_TEXTURE_PIXELS = 67_108_864
 
 
 class BuildError(Exception):
@@ -351,6 +355,16 @@ def deterministic_png(width: int = 64, height: int = 64) -> bytes:
     )
 
 
+def deterministic_png_header(width: int, height: int) -> bytes:
+    """Create a header-only PNG for dimension rejection without pixel allocation."""
+
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + _png_chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+        + _png_chunk(b"IEND", b"")
+    )
+
+
 def _write_lf(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8", newline="\n")
@@ -563,7 +577,44 @@ def _run_packaged_security_proofs(
     valid_config = _naming_rules(security_root / "rules.yaml", duplicates=False)
     invalid_config = security_root / "invalid-utf8.yaml"
     invalid_config.write_bytes(b"version: \xff\xfe\n")
-    inputs = [asset, valid_config, invalid_config]
+    resource_root = security_root / "resource-limits"
+    resource_root.mkdir()
+    oversized_rules = resource_root / "oversized-rules.yaml"
+    oversized_rules.write_bytes(b"#" * (RESOURCE_RULES_BYTES + 1))
+
+    depth_assets = resource_root / "depth-assets"
+    depth_assets.mkdir()
+    deepest = depth_assets
+    for _ in range(RESOURCE_DIRECTORY_DEPTH + 1):
+        deepest = deepest / "d"
+        deepest.mkdir()
+    depth_rules = _naming_rules(resource_root / "depth-rules.yaml", duplicates=False)
+
+    obj_assets = resource_root / "obj-assets"
+    obj_assets.mkdir()
+    oversized_obj_line = obj_assets / "SM_oversized.obj"
+    oversized_obj_line.write_bytes(b"#" + (b"x" * RESOURCE_OBJ_LINE_BYTES))
+    obj_rules = _valid_rules(resource_root / "obj-rules.yaml")
+
+    texture_assets = resource_root / "texture-assets"
+    texture_assets.mkdir()
+    oversized_texture = texture_assets / "T_oversized.png"
+    oversized_texture.write_bytes(deterministic_png_header(8193, 8192))
+    if 8193 * 8192 != RESOURCE_TEXTURE_PIXELS + 8192:
+        raise BuildError("packaged texture resource proof dimensions are invalid")
+    texture_rules = _texture_rules(resource_root / "texture-rules.yaml")
+
+    inputs = [
+        asset,
+        valid_config,
+        invalid_config,
+        oversized_rules,
+        depth_rules,
+        oversized_obj_line,
+        obj_rules,
+        oversized_texture,
+        texture_rules,
+    ]
     before = _asset_state(inputs)
     _create_windows_junction(junction, outside)
     cases = [
@@ -605,6 +656,44 @@ def _run_packaged_security_proofs(
                 security_root / "invalid-utf8.json",
             ),
         ),
+        (
+            "oversized rules resource limit",
+            _scan_command(
+                executable,
+                depth_assets,
+                oversized_rules,
+                resource_root / "oversized-rules.json",
+            ),
+        ),
+        (
+            "directory depth resource limit",
+            _scan_command(
+                executable,
+                depth_assets,
+                depth_rules,
+                resource_root / "depth.json",
+            ),
+        ),
+        (
+            "OBJ line resource limit",
+            _scan_command(
+                executable,
+                obj_assets,
+                obj_rules,
+                resource_root / "obj-line.json",
+            ),
+        ),
+        (
+            "texture pixel resource limit with all destinations",
+            _scan_command(
+                executable,
+                texture_assets,
+                texture_rules,
+                resource_root / "texture-pixels.json",
+                html_output=resource_root / "texture-pixels.html",
+                cache=resource_root / "texture-pixels.sqlite3",
+            ),
+        ),
     ]
     try:
         for name, command in cases:
@@ -614,7 +703,12 @@ def _run_packaged_security_proofs(
                 environment=environment,
                 expected_exit=2,
             )
-            if not result.stderr.startswith("Error:") or "Traceback" in result.stderr:
+            if (
+                not result.stderr.startswith("Error:")
+                or result.stderr.count("Error:") != 1
+                or "Traceback" in result.stderr
+                or result.stdout
+            ):
                 raise BuildError(f"packaged {name} failure was not concise")
             if list(outside.iterdir()):
                 raise BuildError(f"packaged {name} wrote through a junction")
@@ -632,6 +726,15 @@ def _run_packaged_security_proofs(
         "html-safe.json",
         "cache-safe.json",
         "invalid-utf8.json",
+        "oversized-rules.json",
+        "depth.json",
+        "obj-line.json",
+        "texture-pixels.json",
+        "texture-pixels.html",
+        "texture-pixels.sqlite3",
+        "texture-pixels.sqlite3-journal",
+        "texture-pixels.sqlite3-wal",
+        "texture-pixels.sqlite3-shm",
     }
     created = {
         path.name
@@ -826,6 +929,7 @@ def source_input_paths(project_root: Path) -> list[Path]:
         Path("examples/rules.yaml"),
         Path("packaging/windows/assetguard_entry.py"),
         Path("packaging/windows/assetguard.spec"),
+        Path("src/assetguard/resource_limits.py"),
         Path("tools/build_windows_release.py"),
     ]
     source_root = project_root / "src" / "assetguard"

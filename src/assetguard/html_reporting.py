@@ -13,6 +13,14 @@ from assetguard.path_security import (
     prepare_secure_destination,
     validate_secure_path,
 )
+from assetguard.resource_limits import (
+    PRODUCTION_LIMITS,
+    BoundedTextBuilder,
+    ResourceBudget,
+    ResourceLimitError,
+    ResourceLimits,
+    active_resource_budget,
+)
 
 
 class HtmlReportError(Exception):
@@ -55,9 +63,15 @@ def _render_issue_row(issue: Issue) -> str:
     )
 
 
-def render_html_report(report: Report) -> str:
+def render_html_report(
+    report: Report,
+    *,
+    _budget: ResourceBudget | None = None,
+    _limits: ResourceLimits = PRODUCTION_LIMITS,
+) -> str:
     """Render a completed typed report as deterministic, escaped HTML5."""
 
+    budget = _budget or active_resource_budget(_limits)
     try:
         status = "PASSED" if report.summary.passed else "FAILED"
         status_class = "passed" if report.summary.passed else "failed"
@@ -138,10 +152,16 @@ def render_html_report(report: Report) -> str:
             '    <section aria-labelledby="issues-heading">',
             '      <h2 id="issues-heading">Validation issues</h2>',
         ]
+        builder = BoundedTextBuilder(
+            budget,
+            resource="encoded HTML report",
+            limit=budget.limits.html_bytes,
+        )
+        for line in lines:
+            builder.write(line + "\n")
 
         if report.issues:
-            lines.extend(
-                [
+            for line in [
                     '      <div class="table-wrap" role="region" aria-label="Validation issues" tabindex="0">',
                     "        <table>",
                     "          <caption>Validation issues in deterministic report order</caption>",
@@ -155,43 +175,64 @@ def render_html_report(report: Report) -> str:
                     "            </tr>",
                     "          </thead>",
                     "          <tbody>",
-                ]
-            )
-            lines.extend(_render_issue_row(issue) for issue in report.issues)
-            lines.extend(
-                [
+                ]:
+                builder.write(line + "\n")
+            for issue in report.issues:
+                builder.write(_render_issue_row(issue) + "\n")
+            for line in [
                     "          </tbody>",
                     "        </table>",
                     "      </div>",
-                ]
-            )
+                ]:
+                builder.write(line + "\n")
         else:
-            lines.append("      <p>No validation issues were found.</p>")
+            builder.write("      <p>No validation issues were found.</p>\n")
 
-        lines.extend(
-            [
+        for line in [
                 "    </section>",
                 "    <footer>AssetGuard deterministic validation report.</footer>",
                 "  </main>",
                 "</body>",
                 "</html>",
-            ]
-        )
-        return "\n".join(lines) + "\n"
+            ]:
+            builder.write(line + "\n")
+        return builder.finish()
+    except ResourceLimitError:
+        raise
     except (TypeError, ValueError, UnicodeError) as exc:
         raise HtmlReportError("cannot render HTML report") from exc
 
 
-def write_html_report(report: Report, destination: Path) -> None:
+def write_html_report(
+    report: Report,
+    destination: Path,
+    *,
+    _budget: ResourceBudget | None = None,
+    _limits: ResourceLimits = PRODUCTION_LIMITS,
+    _rendered: str | None = None,
+    _stage_only: bool = False,
+) -> Path | None:
     """Atomically write a deterministic HTML report."""
 
+    budget = _budget or active_resource_budget(_limits)
+    rendered = (
+        render_html_report(report, _budget=budget)
+        if _rendered is None
+        else _rendered
+    )
+    normalized = rendered.replace("\r\n", "\n").replace("\r", "\n").rstrip("\n") + "\n"
+    budget.check_value(
+        "encoded HTML report",
+        len(normalized.encode("utf-8")),
+        budget.limits.html_bytes,
+        "UTF-8 bytes",
+    )
+    budget.check_deadline()
     temporary_path: Path | None = None
     try:
         destination = prepare_secure_destination(
             destination, description="HTML report output"
         )
-        rendered = render_html_report(report)
-        normalized = rendered.replace("\r\n", "\n").replace("\r", "\n").rstrip("\n") + "\n"
         validate_secure_path(destination, description="HTML report output")
         with tempfile.NamedTemporaryFile(
             mode="w",
@@ -203,13 +244,30 @@ def write_html_report(report: Report, destination: Path) -> None:
             delete=False,
         ) as temporary_file:
             temporary_path = Path(temporary_file.name)
-            temporary_file.write(normalized)
+            for offset in range(0, len(normalized), 256 * 1024):
+                budget.check_deadline()
+                temporary_file.write(normalized[offset : offset + 256 * 1024])
             temporary_file.flush()
             os.fsync(temporary_file.fileno())
+        budget.check_deadline()
         validate_secure_path(temporary_path, description="HTML report temporary file")
         validate_secure_path(destination, description="HTML report output")
+        budget.check_deadline()
+        if _stage_only:
+            return temporary_path
         os.replace(temporary_path, destination)
+        return None
     except HtmlReportError:
+        raise
+    except ResourceLimitError:
+        if temporary_path is not None:
+            try:
+                validate_secure_path(
+                    temporary_path, description="HTML report temporary file"
+                )
+                temporary_path.unlink(missing_ok=True)
+            except (OSError, PathSecurityError):
+                pass
         raise
     except (OSError, PathSecurityError, TypeError, ValueError, UnicodeError) as exc:
         if temporary_path is not None:
@@ -221,6 +279,29 @@ def write_html_report(report: Report, destination: Path) -> None:
             except (OSError, PathSecurityError):
                 pass
         raise HtmlReportError(f"cannot write HTML report '{destination}': {exc}") from exc
+
+
+def publish_staged_html(temporary_path: Path, destination: Path) -> None:
+    """Atomically publish fully rendered HTML without another resource check."""
+
+    try:
+        validate_secure_path(temporary_path, description="HTML report temporary file")
+        validate_secure_path(destination, description="HTML report output")
+        os.replace(temporary_path, destination)
+    except (OSError, PathSecurityError) as exc:
+        raise HtmlReportError(f"cannot write HTML report '{destination}': {exc}") from exc
+
+
+def discard_staged_html(temporary_path: Path | None) -> None:
+    """Remove an unpublished HTML temporary file after a failed scan."""
+
+    if temporary_path is None:
+        return
+    try:
+        validate_secure_path(temporary_path, description="HTML report temporary file")
+        temporary_path.unlink(missing_ok=True)
+    except (OSError, PathSecurityError):
+        pass
 
 
 def validate_html_output_path(

@@ -554,7 +554,7 @@ def test_parser_failure_rolls_back_new_cache_metrics_and_writes_no_report(
     assert "SM_bad.obj" in result.stderr
     assert "Traceback" not in result.stderr
     assert not output.exists()
-    assert metric_row_count(cache) == 0
+    assert all(not path.exists() for path in cache_related_paths(cache))
 
 
 def test_cache_reads_and_writes_stay_on_coordinator_thread(

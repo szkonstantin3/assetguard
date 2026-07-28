@@ -14,6 +14,14 @@ from assetguard.path_security import (
     prepare_secure_destination,
     validate_secure_path,
 )
+from assetguard.resource_limits import (
+    PRODUCTION_LIMITS,
+    ResourceBudget,
+    ResourceLimitError,
+    ResourceLimits,
+    active_resource_budget,
+    derive_cache_content_key,
+)
 
 CACHE_SCHEMA_VERSION = 1
 TEXTURE_METRICS_VERSION = 1
@@ -159,9 +167,52 @@ def _decode_obj_metrics(payload: str) -> ObjMeshMetrics:
     )
 
 
-def validate_cache_path(cache_path: Path, config_path: Path, output_path: Path) -> Path:
+def _validate_cache_storage(path: Path, budget: ResourceBudget) -> int:
+    """Validate and sum the database and recognized sidecars before SQLite access."""
+
+    total = 0
+    for related in cache_related_paths(path):
+        budget.check_deadline()
+        try:
+            secure_related = validate_secure_path(
+                related,
+                description="cache" if related == path else "cache sidecar",
+            )
+            if not secure_related.exists():
+                continue
+            metadata = secure_related.lstat()
+        except PathSecurityError as exc:
+            raise CacheError(str(exc)) from exc
+        except OSError as exc:
+            raise CacheError(f"cannot inspect cache storage '{related}'") from exc
+        if secure_related.is_dir():
+            raise CacheError(
+                "cache path is a directory"
+                if related == path
+                else "cache sidecar path is a directory"
+            )
+        total += metadata.st_size
+        budget.check_value(
+            "existing cache DB plus journal/WAL/SHM",
+            total,
+            budget.limits.cache_bytes,
+            "bytes",
+        )
+    return total
+
+
+def validate_cache_path(
+    cache_path: Path,
+    config_path: Path,
+    output_path: Path,
+    *,
+    _budget: ResourceBudget | None = None,
+    _limits: ResourceLimits = PRODUCTION_LIMITS,
+) -> Path:
     """Resolve and validate a cache path before any cache file is opened."""
 
+    budget = _budget or active_resource_budget(_limits)
+    budget.check_deadline()
     try:
         resolved_cache = validate_secure_path(cache_path, description="cache")
         resolved_config = validate_secure_path(config_path, description="configuration")
@@ -179,6 +230,7 @@ def validate_cache_path(cache_path: Path, config_path: Path, output_path: Path) 
         raise CacheError("cache path must not be the same as the configuration path")
     if resolved_cache.exists() and resolved_cache.is_dir():
         raise CacheError("cache path is a directory")
+    _validate_cache_storage(resolved_cache, budget)
     return resolved_cache
 
 
@@ -197,23 +249,37 @@ def cache_related_paths(cache_path: Path) -> tuple[Path, Path, Path, Path]:
 class AssetMetricsCache:
     """Transaction-scoped AssetGuard metric cache."""
 
-    def __init__(self, path: Path) -> None:
+    def __init__(
+        self,
+        path: Path,
+        *,
+        _budget: ResourceBudget | None = None,
+        _limits: ResourceLimits = PRODUCTION_LIMITS,
+    ) -> None:
+        self._budget = _budget or active_resource_budget(_limits)
+        self.limits = self._budget.limits
+        self._budget.check_deadline()
         try:
-            path = prepare_secure_destination(path, description="cache")
+            path = validate_secure_path(path, description="cache")
             for sidecar in cache_related_paths(path)[1:]:
                 validate_secure_path(sidecar, description="cache sidecar")
         except PathSecurityError as exc:
             raise CacheError(str(exc)) from exc
         self.path = path
         self._connection: sqlite3.Connection | None = None
+        self._snapshot = self._capture_snapshot()
+        self._restored = False
+        self._committed = False
 
         existed = path.exists()
         if existed and path.is_dir():
             raise CacheError("cache path is a directory")
         try:
-            path.parent.mkdir(parents=True, exist_ok=True)
+            path = prepare_secure_destination(path, description="cache")
         except OSError as exc:
             raise CacheError("cache parent directory could not be created") from exc
+        except PathSecurityError as exc:
+            raise CacheError(str(exc)) from exc
 
         try:
             validate_secure_path(path, description="cache")
@@ -221,6 +287,7 @@ class AssetMetricsCache:
                 validate_secure_path(sidecar, description="cache sidecar")
             connection = sqlite3.connect(str(path), timeout=1.0)
         except (PathSecurityError, sqlite3.Error) as exc:
+            self._restore_snapshot()
             raise CacheError("cache could not be opened") from exc
 
         self._connection = connection
@@ -229,15 +296,67 @@ class AssetMetricsCache:
                 self._validate_existing_schema()
             else:
                 self._initialize_schema()
+            _validate_cache_storage(path, self._budget)
             connection.execute("BEGIN")
+        except ResourceLimitError:
+            connection.close()
+            self._connection = None
+            self._restore_snapshot()
+            raise
         except CacheError:
             connection.close()
             self._connection = None
+            self._restore_snapshot()
             raise
         except sqlite3.Error as exc:
             connection.close()
             self._connection = None
+            self._restore_snapshot()
             raise CacheError("cache transaction could not be started") from exc
+
+    def _capture_snapshot(self) -> dict[Path, bytes | None]:
+        _validate_cache_storage(self.path, self._budget)
+        snapshot: dict[Path, bytes | None] = {}
+        for related in cache_related_paths(self.path):
+            self._budget.check_deadline()
+            if not related.exists():
+                snapshot[related] = None
+                continue
+            try:
+                with related.open("rb") as source:
+                    chunks: list[bytes] = []
+                    while True:
+                        self._budget.check_deadline()
+                        chunk = source.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        chunks.append(chunk)
+                snapshot[related] = b"".join(chunks)
+            except OSError as exc:
+                raise CacheError(f"cache storage '{related}' could not be preserved") from exc
+        return snapshot
+
+    def _restore_snapshot(self) -> None:
+        if self._restored:
+            return
+        if self._connection is not None:
+            try:
+                self._connection.close()
+            finally:
+                self._connection = None
+        try:
+            for related, original in self._snapshot.items():
+                validate_secure_path(
+                    related,
+                    description="cache" if related == self.path else "cache sidecar",
+                )
+                if original is None:
+                    related.unlink(missing_ok=True)
+                elif not related.exists() or related.read_bytes() != original:
+                    related.write_bytes(original)
+        except (OSError, PathSecurityError) as exc:
+            raise CacheError("cache rollback could not restore original bytes") from exc
+        self._restored = True
 
     @property
     def _db(self) -> sqlite3.Connection:
@@ -288,7 +407,9 @@ class AssetMetricsCache:
     def _validate_existing_schema(self) -> None:
         connection = self._db
         try:
+            self._budget.check_deadline()
             integrity_rows = connection.execute("PRAGMA quick_check").fetchall()
+            self._budget.check_deadline()
             if integrity_rows != [("ok",)]:
                 raise CacheError("cache database integrity check failed")
 
@@ -341,6 +462,7 @@ class AssetMetricsCache:
             ]
             if metadata_schema != _METADATA_SCHEMA or metrics_schema != _METRICS_SCHEMA:
                 raise CacheError("AssetGuard cache schema is incompatible")
+            self._budget.check_deadline()
         except CacheError:
             raise
         except sqlite3.Error as exc:
@@ -355,15 +477,21 @@ class AssetMetricsCache:
         exc_value: BaseException | None,
         traceback: object | None,
     ) -> None:
+        rollback_error: CacheError | None = None
         try:
             if self._connection is not None and self._connection.in_transaction:
                 self._connection.rollback()
         except sqlite3.Error as exc:
-            raise CacheError("cache transaction rollback failed") from exc
+            rollback_error = CacheError("cache transaction rollback failed")
+            rollback_error.__cause__ = exc
         finally:
             if self._connection is not None:
                 self._connection.close()
                 self._connection = None
+        if exc_type is not None:
+            self._restore_snapshot()
+        if rollback_error is not None:
+            raise rollback_error
 
     def _fetch_payload(
         self,
@@ -372,6 +500,8 @@ class AssetMetricsCache:
         validator_version: int,
     ) -> str | None:
         _validate_content_digest(content_sha256)
+        cache_key = derive_cache_content_key(content_sha256, self.limits)
+        self._budget.check_deadline()
         try:
             row = self._db.execute(
                 f"""
@@ -381,7 +511,7 @@ class AssetMetricsCache:
                   AND validator_kind = ?
                   AND validator_version = ?
                 """,
-                (content_sha256, validator_kind, validator_version),
+                (cache_key, validator_kind, validator_version),
             ).fetchone()
         except sqlite3.Error as exc:
             raise CacheError("cache metric lookup failed") from exc
@@ -394,6 +524,7 @@ class AssetMetricsCache:
         actual_checksum = _payload_checksum(payload)
         if not hmac.compare_digest(actual_checksum, stored_checksum):
             raise CacheError(f"cached {validator_kind} metrics payload checksum mismatch")
+        self._budget.check_deadline()
         return payload
 
     def _store_payload(
@@ -404,6 +535,8 @@ class AssetMetricsCache:
         payload: str,
     ) -> None:
         _validate_content_digest(content_sha256)
+        cache_key = derive_cache_content_key(content_sha256, self.limits)
+        self._budget.check_deadline()
         try:
             self._db.execute(
                 f"""
@@ -416,7 +549,7 @@ class AssetMetricsCache:
                 ) VALUES (?, ?, ?, ?, ?)
                 """,
                 (
-                    content_sha256,
+                    cache_key,
                     validator_kind,
                     validator_version,
                     payload,
@@ -425,6 +558,7 @@ class AssetMetricsCache:
             )
         except sqlite3.Error as exc:
             raise CacheError("cache metric write failed") from exc
+        _validate_cache_storage(self.path, self._budget)
 
     def get_texture(self, content_sha256: str) -> TextureMetrics | None:
         payload = self._fetch_payload(
@@ -461,6 +595,7 @@ class AssetMetricsCache:
         )
 
     def commit(self) -> None:
+        self._budget.check_deadline()
         try:
             self._db.commit()
         except sqlite3.Error as exc:
@@ -469,3 +604,10 @@ class AssetMetricsCache:
             except sqlite3.Error as rollback_exc:
                 raise CacheError("cache commit and rollback failed") from rollback_exc
             raise CacheError("cache commit failed") from exc
+        try:
+            _validate_cache_storage(self.path, self._budget)
+            self._budget.check_deadline()
+        except ResourceLimitError:
+            self._restore_snapshot()
+            raise
+        self._committed = True
