@@ -132,15 +132,19 @@ The optional cache is an AssetGuard-owned SQLite database keyed by the current f
 - texture width and height;
 - OBJ face, calculated triangle, non-triangulated-face, face-corner, UV-corner, and material-slot counts.
 
-AssetGuard recalculates SHA-256 from the candidate file bytes before every cache lookup. It therefore still reads each configured texture and OBJ file on every scan; the cache avoids repeated Pillow or OBJ parsing, not file I/O. File size, modification time, and path are never trusted as content identity.
+AssetGuard recalculates SHA-256 and independently enforces texture/OBJ content budgets before every cache lookup. A hit reuses typed metrics only after that resource validation succeeds; it cannot bypass parser safety ceilings. File size, modification time, and path are never trusted as content identity.
 
-Phase 04 preserves that rule: candidate bytes are still read for SHA-256 before coordinator-thread cache lookup. Cache misses may be parsed concurrently, but SQLite ownership checks, reads, writes, rollback, commit, and close operations remain on the coordinator thread using SQLite's default same-thread protection.
+Cache keys bind the current file-content SHA-256 to the canonical fingerprint of the complete fixed resource policy, validator kind, and validator metric version. Legacy pre-policy rows are safe misses without a schema migration. Cache misses may be parsed concurrently, but SQLite ownership checks, reads, writes, rollback, commit, and close operations remain on the coordinator thread using SQLite's default same-thread protection.
 
 Current configuration rules are reapplied to typed metrics after every hit, so changing thresholds, toggles, severity, or a filename takes effect without invalidating the metric entry. Naming results, duplicate groups, rule settings, final issues, and paths are not cached.
 
 When enabled, the CLI prints `Cache hits` and `Cache misses`. These count configured content validators, not all files. Statistics and the cache path never enter the JSON report. A cache stored under the scanned root, including its `-journal`, `-wal`, and `-shm` sidecar names, is excluded from scanning.
 
 Existing cache files must contain the AssetGuard ownership marker and supported schema. Incompatible, unrelated, locked, corrupted, or invalid-payload databases fail with exit code `2`; AssetGuard does not delete, rebuild, migrate, or repair them.
+
+## Resource and abuse-resistance policy
+
+AssetGuard enforces fixed inclusive production ceilings for rules, YAML structure, directory trees, logical file bytes, textures, OBJ records and tokens, issues, reports, cache storage, parallel work, and total cooperative runtime. These limits cannot be changed by project YAML, environment variables, or CLI flags. Excess input fails the complete scan with exit code `2`; it is never truncated or partially reported. The exact table, accounting definitions, cache fingerprint behavior, and cooperative-timeout limitations are documented in [Deterministic resource limits](docs/resource-limits.md).
 
 Exit codes are:
 
@@ -291,7 +295,7 @@ A dependent `package-windows` job uses Windows and Python 3.13.9 to synchronize 
 
 ## Current limitations
 
-Phase 07 supports only OBJ meshes and does not validate referenced index ranges. It has no multiprocessing, automatic worker selection, parallel SQLite access, or metadata-only cache shortcut. Candidate file bytes are still read for SHA-256 on every applicable scan. Concurrent modification of assets during a scan is unsupported, and performance depends on the filesystem and asset types.
+Phase 07 supports only OBJ meshes and does not validate referenced index ranges. It has no multiprocessing, automatic worker selection, parallel SQLite access, or metadata-only cache shortcut. Candidate file bytes are still read for SHA-256 on every applicable scan. Detectable replacement, growth, shrinkage, or metadata change during a scan is rejected; without native directory handles, a narrow same-identity concurrent-content substitution window remains. Performance depends on the filesystem and asset types.
 
 The HTML report is static and has no interactive filtering, charts, PDF export, historical analytics, or live asset links. The cache has no pruning, migration, parallel-access guarantee, or repair command. AssetGuard has no GUI, asset repair or conversion, other mesh formats, full filesystem incremental skipping, Blender integration, or engine integration. The executable has no installer or code signature. Hosted results remain commit-specific, and local validation alone does not prove every supported runner and Python combination.
 

@@ -1,12 +1,16 @@
 """Deterministic directory scanning and asset validation."""
 
 import hashlib
+import json
 import os
+import re
 import stat
+import threading
+import warnings
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable
 
 from PIL import Image, UnidentifiedImageError
 
@@ -19,13 +23,30 @@ from assetguard.cache import (
 )
 from assetguard.config import AssetGuardConfig
 from assetguard.models import Issue, Report, ScanInfo, Summary, ToolInfo
-from assetguard.obj_mesh import ObjMeshMetrics, ObjParseError, parse_obj
-from assetguard.parallel import MAX_WORKERS, MIN_WORKERS, ordered_bounded_map
+from assetguard.obj_mesh import (
+    ObjMeshMetrics,
+    ObjParseError,
+    parse_obj,
+    validate_obj_resources,
+)
+from assetguard.parallel import (
+    MAX_WORKERS,
+    MIN_WORKERS,
+    ordered_bounded_map,
+    resource_budget_context,
+)
 from assetguard.path_security import (
     PathSecurityError,
     lexical_absolute_path,
     validate_existing_entry,
     validate_secure_path,
+)
+from assetguard.resource_limits import (
+    PRODUCTION_LIMITS,
+    ResourceBudget,
+    ResourceLimitError,
+    ResourceLimits,
+    active_resource_budget,
 )
 
 HASH_CHUNK_SIZE = 1024 * 1024
@@ -43,11 +64,21 @@ class CachedScanResult:
 
 
 @dataclass(frozen=True, slots=True)
+class _FileIdentity:
+    device: int
+    inode: int
+    size: int
+    modified_ns: int
+
+
+@dataclass(frozen=True, slots=True)
 class _ScannedFile:
     relative_path: str
     path: Path
     is_texture: bool
     is_mesh: bool
+    identity: _FileIdentity | None = None
+    budget: ResourceBudget | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,6 +87,11 @@ class _ParseWork:
     path: Path
     validator_kind: str
     content_digest: str | None
+    identity: _FileIdentity | None = None
+    budget: ResourceBudget | None = None
+
+
+_WORK_CONTEXT = threading.local()
 
 
 def _resolved_path(path: Path) -> Path:
@@ -72,49 +108,117 @@ def _safe_scan_entry(path: Path, *, description: str) -> os.stat_result:
         raise ScanError(str(exc)) from exc
 
 
+def _file_identity(metadata: os.stat_result) -> _FileIdentity:
+    return _FileIdentity(
+        device=int(metadata.st_dev),
+        inode=int(metadata.st_ino),
+        size=int(metadata.st_size),
+        modified_ns=int(metadata.st_mtime_ns),
+    )
+
+
+def _identity_matches(metadata: os.stat_result, identity: _FileIdentity) -> bool:
+    return stat.S_ISREG(metadata.st_mode) and _file_identity(metadata) == identity
+
+
+def _verify_file_identity(
+    path: Path,
+    relative_path: str,
+    identity: _FileIdentity,
+) -> None:
+    metadata = _safe_scan_entry(path, description="scanned file entry")
+    if not _identity_matches(metadata, identity):
+        raise ScanError(f"scanned file '{relative_path}' changed after resource preflight")
+
+
 def _collect_files(
     root: Path,
     excluded_directories: set[str],
     excluded_files: set[Path],
-) -> list[tuple[str, Path]]:
-    collected: list[tuple[str, Path]] = []
+) -> list[tuple[str, Path, _FileIdentity]]:
+    budget = getattr(_WORK_CONTEXT, "collection_budget", None)
+    if not isinstance(budget, ResourceBudget):
+        budget = active_resource_budget()
+    collected: list[tuple[str, Path, _FileIdentity]] = []
 
-    def raise_walk_error(error: OSError) -> None:
-        raise ScanError(f"cannot access scanned directory: {error}") from error
+    def visit(current_path: Path, relative_parts: tuple[str, ...]) -> None:
+        budget.check_deadline()
+        directory_metadata = _safe_scan_entry(
+            current_path, description="scanned directory"
+        )
+        if not stat.S_ISDIR(directory_metadata.st_mode):
+            raise ScanError(f"scanned directory entry is not a directory: '{current_path}'")
 
-    for current_root, directory_names, file_names in os.walk(
-        root, topdown=True, onerror=raise_walk_error, followlinks=False
-    ):
-        current_path = Path(current_root)
-        _safe_scan_entry(current_path, description="scanned directory")
-        safe_directories: list[str] = []
-        for directory_name in sorted(directory_names):
-            directory_path = current_path / directory_name
-            metadata = _safe_scan_entry(
-                directory_path, description="scanned directory entry"
+        names: list[str] = []
+        try:
+            with os.scandir(current_path) as entries:
+                for entry in entries:
+                    budget.check_deadline()
+                    observed = len(names) + 1
+                    budget.check_value(
+                        "entries within one directory",
+                        observed,
+                        budget.limits.directory_entries,
+                        "entries",
+                        path="/".join(relative_parts) or None,
+                    )
+                    names.append(entry.name)
+        except ResourceLimitError:
+            raise
+        except OSError as exc:
+            raise ScanError(f"cannot access scanned directory: {exc}") from exc
+
+        for name in sorted(names):
+            budget.check_deadline()
+            entry_parts = (*relative_parts, name)
+            relative_path = "/".join(entry_parts)
+            budget.check_value(
+                "relative directory depth",
+                len(entry_parts),
+                budget.limits.relative_depth,
+                "levels",
+                path=relative_path,
             )
-            if not stat.S_ISDIR(metadata.st_mode):
-                raise ScanError(f"scanned directory entry is not a directory: '{directory_path}'")
-            if directory_name not in excluded_directories:
-                safe_directories.append(directory_name)
-        directory_names[:] = safe_directories
-        for file_name in sorted(file_names):
-            file_path = Path(current_root) / file_name
-            resolved_file = _resolved_path(file_path)
-            if resolved_file in excluded_files:
+            try:
+                path_bytes = len(relative_path.encode("utf-8"))
+            except UnicodeEncodeError as exc:
+                raise ScanError(
+                    f"scanned path is not valid UTF-8: '{relative_path}'"
+                ) from exc
+            budget.check_value(
+                "relative path UTF-8 bytes",
+                path_bytes,
+                budget.limits.relative_path_bytes,
+                "bytes",
+                path=relative_path,
+            )
+            budget.add_tree_entry(path=relative_path)
+
+            entry_path = current_path / name
+            metadata = _safe_scan_entry(entry_path, description="scanned tree entry")
+            if stat.S_ISDIR(metadata.st_mode):
+                if name not in excluded_directories:
+                    visit(entry_path, entry_parts)
                 continue
-            metadata = _safe_scan_entry(file_path, description="scanned file entry")
             if not stat.S_ISREG(metadata.st_mode):
                 continue
-            relative_path = file_path.relative_to(root).as_posix()
-            collected.append((relative_path, file_path))
+            if lexical_absolute_path(entry_path) in excluded_files:
+                continue
+            budget.add_regular_file(metadata.st_size, path=relative_path)
+            collected.append((relative_path, entry_path, _file_identity(metadata)))
 
+    visit(root, ())
     collected.sort(key=lambda item: item[0])
     return collected
 
 
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
+    budget = getattr(_WORK_CONTEXT, "budget", None)
+    identity = getattr(_WORK_CONTEXT, "identity", None)
+    relative_path = getattr(_WORK_CONTEXT, "relative_path", path.name)
+    if isinstance(budget, ResourceBudget):
+        budget.check_deadline()
     try:
         _safe_scan_entry(path, description="scanned file entry")
     except ScanError as exc:
@@ -125,37 +229,129 @@ def _sha256(path: Path) -> str:
         raise
     try:
         with path.open("rb") as source:
-            while chunk := source.read(HASH_CHUNK_SIZE):
+            if isinstance(identity, _FileIdentity):
+                opened_metadata = os.fstat(source.fileno())
+                if not _identity_matches(opened_metadata, identity):
+                    raise ScanError(
+                        f"scanned file '{relative_path}' changed after resource preflight"
+                    )
+            bytes_read = 0
+            while True:
+                if isinstance(budget, ResourceBudget):
+                    budget.check_deadline()
+                chunk = source.read(HASH_CHUNK_SIZE)
+                if not chunk:
+                    break
+                bytes_read += len(chunk)
+                if isinstance(identity, _FileIdentity) and bytes_read > identity.size:
+                    raise ScanError(
+                        f"scanned file '{relative_path}' grew after resource preflight"
+                    )
                 digest.update(chunk)
+                if isinstance(budget, ResourceBudget):
+                    budget.check_deadline()
+            if isinstance(identity, _FileIdentity):
+                final_metadata = os.fstat(source.fileno())
+                if bytes_read != identity.size or not _identity_matches(
+                    final_metadata, identity
+                ):
+                    raise ScanError(
+                        f"scanned file '{relative_path}' changed after resource preflight"
+                    )
     except OSError as exc:
         raise ScanError("file could not be read") from exc
+    if isinstance(identity, _FileIdentity):
+        _verify_file_identity(path, relative_path, identity)
     return digest.hexdigest()
 
 
 def _hash_scanned_file(asset: _ScannedFile) -> str:
+    previous_budget = getattr(_WORK_CONTEXT, "budget", None)
+    previous_identity = getattr(_WORK_CONTEXT, "identity", None)
+    previous_path = getattr(_WORK_CONTEXT, "relative_path", None)
+    _WORK_CONTEXT.budget = asset.budget
+    _WORK_CONTEXT.identity = asset.identity
+    _WORK_CONTEXT.relative_path = asset.relative_path
     try:
         return _sha256(asset.path)
+    except ResourceLimitError:
+        raise
     except ScanError as exc:
         raise ScanError(f"cannot hash asset '{asset.relative_path}': {exc}") from exc
     except Exception as exc:
         raise ScanError(
             f"cannot hash asset '{asset.relative_path}': unexpected hashing failure"
         ) from exc
+    finally:
+        _WORK_CONTEXT.budget = previous_budget
+        _WORK_CONTEXT.identity = previous_identity
+        _WORK_CONTEXT.relative_path = previous_path
 
 
 def _is_power_of_two(value: int) -> bool:
     return value > 0 and value & (value - 1) == 0
 
 
-def _read_texture_metrics(relative_path: str, path: Path) -> TextureMetrics:
+def _decompression_bomb_pixels(error: BaseException, limit: int) -> int:
+    match = re.search(r"(\d+) pixels", str(error))
+    return int(match.group(1)) if match else limit + 1
+
+
+def _inspect_texture(
+    relative_path: str,
+    path: Path,
+    budget: ResourceBudget,
+    identity: _FileIdentity | None,
+) -> TextureMetrics:
+    budget.check_deadline()
     try:
         _safe_scan_entry(path, description="scanned texture entry")
-        with Image.open(path) as image:
-            width, height = image.size
-            image.verify()
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            with Image.open(path) as image:
+                budget.check_deadline()
+                width, height = image.size
+                if width <= 0 or height <= 0:
+                    raise ValueError("texture dimensions must be positive")
+                pixel_count = width * height
+                if height > budget.limits.texture_pixels // width:
+                    raise ResourceLimitError(
+                        "texture pixels",
+                        pixel_count,
+                        budget.limits.texture_pixels,
+                        "pixels",
+                        path=relative_path,
+                    )
+                image.verify()
+                budget.check_deadline()
+    except ResourceLimitError:
+        raise
+    except (Image.DecompressionBombWarning, Image.DecompressionBombError) as exc:
+        raise ResourceLimitError(
+            "texture pixels",
+            _decompression_bomb_pixels(exc, budget.limits.texture_pixels),
+            budget.limits.texture_pixels,
+            "pixels",
+            path=relative_path,
+        ) from exc
     except (OSError, ValueError, UnidentifiedImageError) as exc:
         raise ScanError(f"cannot read texture '{relative_path}': {exc}") from exc
+    if identity is not None:
+        _verify_file_identity(path, relative_path, identity)
     return TextureMetrics(width=width, height=height)
+
+
+def _read_texture_metrics(relative_path: str, path: Path) -> TextureMetrics:
+    budget = getattr(_WORK_CONTEXT, "budget", None)
+    if not isinstance(budget, ResourceBudget):
+        budget = active_resource_budget()
+    identity = getattr(_WORK_CONTEXT, "identity", None)
+    return _inspect_texture(
+        relative_path,
+        path,
+        budget,
+        identity if isinstance(identity, _FileIdentity) else None,
+    )
 
 
 def _texture_issues(
@@ -210,14 +406,32 @@ def _texture_issues(
 
 
 def _read_mesh_metrics(relative_path: str, path: Path) -> ObjMeshMetrics:
+    budget = getattr(_WORK_CONTEXT, "budget", None)
+    if not isinstance(budget, ResourceBudget):
+        budget = active_resource_budget()
+    identity = getattr(_WORK_CONTEXT, "identity", None)
     try:
         _safe_scan_entry(path, description="scanned mesh entry")
-        return parse_obj(path)
+        metrics = parse_obj(
+            path,
+            _budget=budget,
+            _relative_path=relative_path,
+            _expected_size=(identity.size if isinstance(identity, _FileIdentity) else None),
+        )
+        if isinstance(identity, _FileIdentity):
+            _verify_file_identity(path, relative_path, identity)
+        return metrics
     except ObjParseError as exc:
         raise ScanError(f"cannot parse mesh '{relative_path}': {exc}") from exc
 
 
 def _parse_asset_metrics(work: _ParseWork) -> TextureMetrics | ObjMeshMetrics:
+    previous_budget = getattr(_WORK_CONTEXT, "budget", None)
+    previous_identity = getattr(_WORK_CONTEXT, "identity", None)
+    previous_path = getattr(_WORK_CONTEXT, "relative_path", None)
+    _WORK_CONTEXT.budget = work.budget
+    _WORK_CONTEXT.identity = work.identity
+    _WORK_CONTEXT.relative_path = work.relative_path
     try:
         if work.validator_kind == TEXTURE_VALIDATOR_KIND:
             return _read_texture_metrics(work.relative_path, work.path)
@@ -226,12 +440,16 @@ def _parse_asset_metrics(work: _ParseWork) -> TextureMetrics | ObjMeshMetrics:
         raise ScanError(
             f"internal error: unsupported validator kind '{work.validator_kind}'"
         )
-    except ScanError:
+    except (ResourceLimitError, ScanError):
         raise
     except Exception as exc:
         raise ScanError(
             f"cannot parse asset '{work.relative_path}': unexpected parser failure"
         ) from exc
+    finally:
+        _WORK_CONTEXT.budget = previous_budget
+        _WORK_CONTEXT.identity = previous_identity
+        _WORK_CONTEXT.relative_path = previous_path
 
 
 def _mesh_issues(
@@ -310,17 +528,29 @@ def _mesh_issues(
     return issues
 
 
-def _scan_directory(
+def _append_issue(issues: list[Issue], issue: Issue, budget: ResourceBudget) -> None:
+    payload = json.dumps(
+        issue.model_dump(mode="json", exclude_none=True),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    budget.reserve_issue(len(payload), path=issue.path)
+    issues.append(issue)
+
+
+def _prepare_scan_files(
     root: Path,
     config: AssetGuardConfig,
     *,
-    metrics_cache: AssetMetricsCache | None,
     excluded_files: Iterable[Path] = (),
-    workers: int = 1,
-) -> CachedScanResult:
+    _budget: ResourceBudget | None = None,
+    _limits: ResourceLimits = PRODUCTION_LIMITS,
+) -> tuple[_ScannedFile, ...]:
+    """Complete deterministic structural preflight without opening a cache."""
 
-    if not MIN_WORKERS <= workers <= MAX_WORKERS:
-        raise ScanError(f"workers must be between {MIN_WORKERS} and {MAX_WORKERS}")
+    budget = _budget or active_resource_budget(_limits)
+    budget.check_deadline()
     lexical_root = lexical_absolute_path(root)
     if not os.path.lexists(lexical_root):
         raise ScanError(f"input directory does not exist: '{root}'")
@@ -333,15 +563,21 @@ def _scan_directory(
     if not stat.S_ISDIR(root_metadata.st_mode):
         raise ScanError(f"input path is not a directory: '{root}'")
 
+    budget.check_deadline()
     resolved_root = _resolved_path(lexical_root)
     resolved_exclusions = {_resolved_path(path) for path in excluded_files}
-    collected_files = _collect_files(
-        resolved_root,
-        set(config.scan.exclude_directories),
-        resolved_exclusions,
-    )
+    previous_collection_budget = getattr(_WORK_CONTEXT, "collection_budget", None)
+    _WORK_CONTEXT.collection_budget = budget
+    try:
+        collected_files = _collect_files(
+            resolved_root,
+            set(config.scan.exclude_directories),
+            resolved_exclusions,
+        )
+    finally:
+        _WORK_CONTEXT.collection_budget = previous_collection_budget
 
-    files = [
+    files = tuple(
         _ScannedFile(
             relative_path=relative_path,
             path=file_path,
@@ -353,9 +589,54 @@ def _scan_directory(
                 config.meshes.enabled
                 and file_path.suffix.lower() in config.meshes.extensions
             ),
+            identity=identity,
+            budget=budget,
         )
-        for relative_path, file_path in collected_files
-    ]
+        for relative_path, file_path, identity in collected_files
+    )
+    for asset in files:
+        if asset.is_mesh and asset.identity is not None:
+            budget.check_value(
+                "one OBJ file",
+                asset.identity.size,
+                budget.limits.obj_file_bytes,
+                "bytes",
+                path=asset.relative_path,
+            )
+    return files
+
+
+def _scan_directory(
+    root: Path,
+    config: AssetGuardConfig,
+    *,
+    metrics_cache: AssetMetricsCache | None,
+    excluded_files: Iterable[Path] = (),
+    workers: int = 1,
+    _budget: ResourceBudget | None = None,
+    _limits: ResourceLimits = PRODUCTION_LIMITS,
+    _clock: Callable[[], float] | None = None,
+    _prepared_files: tuple[_ScannedFile, ...] | None = None,
+) -> CachedScanResult:
+
+    budget = _budget or (
+        active_resource_budget(_limits)
+        if _clock is None
+        else ResourceBudget(_limits, clock=_clock)
+    )
+    maximum_workers = min(MAX_WORKERS, budget.limits.max_workers)
+    if not MIN_WORKERS <= workers <= maximum_workers:
+        raise ScanError(f"workers must be between {MIN_WORKERS} and {maximum_workers}")
+    files = list(
+        _prepared_files
+        if _prepared_files is not None
+        else _prepare_scan_files(
+            root,
+            config,
+            excluded_files=excluded_files,
+            _budget=budget,
+        )
+    )
 
     if config.duplicates.enabled:
         hash_work = files
@@ -365,8 +646,9 @@ def _scan_directory(
         hash_work = []
 
     try:
-        digest_results = ordered_bounded_map(_hash_scanned_file, hash_work, workers)
-    except ScanError:
+        with resource_budget_context(budget):
+            digest_results = ordered_bounded_map(_hash_scanned_file, hash_work, workers)
+    except (ResourceLimitError, ScanError):
         raise
     except Exception as exc:
         raise ScanError("parallel hashing failed") from exc
@@ -374,6 +656,38 @@ def _scan_directory(
         asset.relative_path: digest
         for asset, digest in zip(hash_work, digest_results, strict=True)
     }
+
+    resource_metrics: dict[
+        tuple[str, str], TextureMetrics | ObjMeshMetrics
+    ] = {}
+    for asset in files:
+        budget.check_deadline()
+        if asset.is_texture:
+            resource_metrics[(asset.relative_path, TEXTURE_VALIDATOR_KIND)] = (
+                _inspect_texture(
+                    asset.relative_path,
+                    asset.path,
+                    budget,
+                    asset.identity,
+                )
+            )
+        if asset.is_mesh:
+            if asset.identity is None:
+                raise ScanError("internal error: OBJ candidate has no file identity")
+            try:
+                resource_metrics[(asset.relative_path, OBJ_VALIDATOR_KIND)] = (
+                    validate_obj_resources(
+                        asset.path,
+                        budget=budget,
+                        relative_path=asset.relative_path,
+                        expected_size=asset.identity.size,
+                    )
+                )
+            except ObjParseError as exc:
+                raise ScanError(
+                    f"cannot parse mesh '{asset.relative_path}': {exc}"
+                ) from exc
+            _verify_file_identity(asset.path, asset.relative_path, asset.identity)
 
     metric_by_candidate: dict[
         tuple[str, str], TextureMetrics | ObjMeshMetrics
@@ -399,6 +713,8 @@ def _scan_directory(
                     path=asset.path,
                     validator_kind=validator_kind,
                     content_digest=None,
+                    identity=asset.identity,
+                    budget=budget,
                 )
                 parse_work.append(work)
                 candidate_identity[candidate_key] = (validator_kind, asset.relative_path)
@@ -415,11 +731,18 @@ def _scan_directory(
                 continue
 
             if validator_kind == TEXTURE_VALIDATOR_KIND:
+                budget.check_deadline()
                 cached_metrics = metrics_cache.get_texture(content_digest)
             else:
+                budget.check_deadline()
                 cached_metrics = metrics_cache.get_obj(content_digest)
 
             if cached_metrics is not None:
+                if cached_metrics != resource_metrics[candidate_key]:
+                    raise ScanError(
+                        f"cached {validator_kind} metrics do not match asset "
+                        f"'{asset.relative_path}'"
+                    )
                 cache_hits += 1
                 metric_by_candidate[identity] = cached_metrics
                 continue
@@ -430,13 +753,16 @@ def _scan_directory(
                 path=asset.path,
                 validator_kind=validator_kind,
                 content_digest=content_digest,
+                identity=asset.identity,
+                budget=budget,
             )
             pending_by_identity[identity] = work
             parse_work.append(work)
 
     try:
-        parsed_results = ordered_bounded_map(_parse_asset_metrics, parse_work, workers)
-    except ScanError:
+        with resource_budget_context(budget):
+            parsed_results = ordered_bounded_map(_parse_asset_metrics, parse_work, workers)
+    except (ResourceLimitError, ScanError):
         raise
     except Exception as exc:
         raise ScanError("parallel parser execution failed") from exc
@@ -452,18 +778,21 @@ def _scan_directory(
     hashes: dict[str, list[str]] = defaultdict(list)
 
     for asset in files:
+        budget.check_deadline()
         relative_path = asset.relative_path
         if config.naming.enabled and not asset.path.name.startswith(
             tuple(config.naming.allowed_prefixes)
         ):
-            issues.append(
+            _append_issue(
+                issues,
                 Issue(
                     code="NAMING_INVALID_PREFIX",
                     severity=config.naming.severity,
                     path=relative_path,
                     message="Filename does not start with an allowed prefix.",
                     details={"allowed_prefixes": config.naming.allowed_prefixes},
-                )
+                ),
+                budget,
             )
 
         if asset.is_texture:
@@ -472,7 +801,8 @@ def _scan_directory(
             ]
             if not isinstance(texture_metrics, TextureMetrics):
                 raise ScanError("internal error: texture parser returned invalid metrics")
-            issues.extend(_texture_issues(relative_path, texture_metrics, config))
+            for issue in _texture_issues(relative_path, texture_metrics, config):
+                _append_issue(issues, issue, budget)
 
         if asset.is_mesh:
             mesh_metrics = metric_by_candidate[
@@ -480,13 +810,22 @@ def _scan_directory(
             ]
             if not isinstance(mesh_metrics, ObjMeshMetrics):
                 raise ScanError("internal error: OBJ parser returned invalid metrics")
-            issues.extend(_mesh_issues(relative_path, mesh_metrics, config))
+            for issue in _mesh_issues(relative_path, mesh_metrics, config):
+                _append_issue(issues, issue, budget)
 
         if config.duplicates.enabled:
             content_digest = digests.get(relative_path)
             if content_digest is None:
                 raise ScanError("internal error: duplicate candidate has no content digest")
-            hashes[content_digest].append(relative_path)
+            members = hashes[content_digest]
+            budget.check_value(
+                "members in one duplicate group",
+                len(members) + 1,
+                budget.limits.duplicate_members,
+                "members",
+                path=relative_path,
+            )
+            members.append(relative_path)
 
     if metrics_cache is not None:
         cache_writes = sorted(
@@ -502,6 +841,7 @@ def _scan_directory(
             ),
         )
         for work in cache_writes:
+            budget.check_deadline()
             content_digest = work.content_digest
             if content_digest is None:
                 raise ScanError("internal error: cache write has no content digest")
@@ -514,28 +854,39 @@ def _scan_directory(
                 if not isinstance(metrics, ObjMeshMetrics):
                     raise ScanError("internal error: invalid cached OBJ metrics")
                 metrics_cache.store_obj(content_digest, metrics)
+            budget.check_deadline()
 
     duplicate_groups = 0
     if config.duplicates.enabled:
         for digest, members in sorted(hashes.items()):
+            budget.check_deadline()
             if len(members) < 2:
                 continue
             sorted_members = sorted(members)
             duplicate_groups += 1
-            issues.append(
+            _append_issue(
+                issues,
                 Issue(
                     code="DUPLICATE_CONTENT",
                     severity=config.duplicates.severity,
                     path=sorted_members[0],
                     message=f"{len(sorted_members)} files have identical content.",
                     details={"paths": sorted_members, "sha256": digest},
-                )
+                ),
+                budget,
             )
+
+    for asset in files:
+        budget.check_deadline()
+        if asset.identity is None:
+            raise ScanError("internal error: scanned file has no identity")
+        _verify_file_identity(asset.path, asset.relative_path, asset.identity)
 
     issues.sort(key=lambda issue: (issue.code, issue.path, issue.message))
     error_count = sum(issue.severity == "error" for issue in issues)
     warning_count = sum(issue.severity == "warning" for issue in issues)
 
+    budget.check_deadline()
     return CachedScanResult(
         report=Report(
             tool=ToolInfo(version=__version__),
@@ -563,6 +914,9 @@ def scan_directory(
     *,
     excluded_files: Iterable[Path] = (),
     workers: int = 1,
+    _budget: ResourceBudget | None = None,
+    _limits: ResourceLimits = PRODUCTION_LIMITS,
+    _clock: Callable[[], float] | None = None,
 ) -> Report:
     """Scan without caching and return the deterministic public report."""
 
@@ -572,6 +926,9 @@ def scan_directory(
         metrics_cache=None,
         excluded_files=excluded_files,
         workers=workers,
+        _budget=_budget,
+        _limits=_limits,
+        _clock=_clock,
     ).report
 
 
@@ -582,6 +939,10 @@ def scan_directory_with_cache(
     *,
     excluded_files: Iterable[Path] = (),
     workers: int = 1,
+    _budget: ResourceBudget | None = None,
+    _limits: ResourceLimits = PRODUCTION_LIMITS,
+    _clock: Callable[[], float] | None = None,
+    _prepared_files: tuple[_ScannedFile, ...] | None = None,
 ) -> CachedScanResult:
     """Scan with content-addressed metric reuse and return internal cache statistics."""
 
@@ -591,4 +952,8 @@ def scan_directory_with_cache(
         metrics_cache=metrics_cache,
         excluded_files=excluded_files,
         workers=workers,
+        _budget=_budget,
+        _limits=_limits,
+        _clock=_clock,
+        _prepared_files=_prepared_files,
     )

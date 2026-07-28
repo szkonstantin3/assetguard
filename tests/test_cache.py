@@ -818,7 +818,8 @@ def test_malformed_asset_is_not_cached_and_writes_no_report(
 
     assert result.exit_code == 2
     assert not output.exists()
-    assert cache_rows(cache) == []
+    assert not cache.exists()
+    assert all(not path.exists() for path in cache_related_paths(cache))
     assert "Traceback" not in result.stderr
 
 
